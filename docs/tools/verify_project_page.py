@@ -24,8 +24,7 @@ REQUIRED_ASSETS = [
     "static/images/rd/cross_silhouette_kmeans_example_tsne.png",
     "static/images/rd/method_overview.png",
     "static/images/rd/method_comparison_summary.png",
-    "static/images/rd/steering_source_cluster5_grid.png",
-    "static/images/steering_demonstration.png",
+    "static/images/steering_demon_wp.png",
     "static/images/wave-particle-duality.jpeg",
 ]
 
@@ -330,7 +329,7 @@ def main():
         fail("favicon should use the wave-particle duality image")
     if 'id="knobs"' in html or "Two Knobs: Granularity and View Balance" in html:
         fail("Two Knobs section should not be present on the webpage")
-    if 'href="static/css/index.css?v=steering-grid-v1"' not in html:
+    if 'href="static/css/index.css?v=steering-wp-v1"' not in html:
         fail("stylesheet should be cache-busted after switching to the steering demonstration")
     if '<section class="section cluster-band" id="cluster-dynamics">' not in html:
         fail("cluster dynamics section should explicitly use the white band")
@@ -463,7 +462,7 @@ def main():
         "amplification raises the cluster's relative preference, and suppression lowers it",
         "In the demonstration below, the star marks the source continuation defining the steering direction.",
         "star marks the source continuation defining the steering direction",
-        "steering_demonstration.png",
+        "steering_demon_wp.png",
         "the selected RD medoid direction provides top-B attribution features for activation steering",
         "target-logit changes are measured for cluster members",
         "Cluster-Level Transfer Case Study",
@@ -512,7 +511,9 @@ def main():
         fail("Causal Validation should use paragraph introduction, not the removed three-card results strip")
     removed_steering_grid_refs = [
         'data-panel-group="steering-source-projection"',
+        "steering_source_cluster5_grid.png",
         "steering_source_cluster5_grid_tsne.png",
+        "steering_demonstration.png",
     ]
     for removed in removed_steering_grid_refs:
         if removed in html:
@@ -522,7 +523,6 @@ def main():
         "Score interpretation:",
         "Pipeline:",
         "Iteration view:",
-        "Source selection:",
         "Steering setup:",
         "Correlation check:",
         "Case-study implication:",
@@ -550,7 +550,6 @@ def main():
             fail(f"method overview unframed styling missing: {required}")
     required_steering_source_css = [
         ".steering-source-copy",
-        ".steering-source-grid-figure",
         ".steering-demo-figure",
         ".steering-result-layout",
         ".steering-result-figure",
