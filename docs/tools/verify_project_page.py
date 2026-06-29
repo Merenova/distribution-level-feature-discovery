@@ -484,6 +484,7 @@ def main():
         "a random single continuation can be weak or even reverse sign",
         "captures a cluster-level causal factor shared across continuations",
         "Caveats",
+        "Our work treats RD clusters",
         "useful mechanistic hypotheses",
         "not complete circuit explanations",
         "the intervention target is the mean demeaned logit over a sampled continuation",
