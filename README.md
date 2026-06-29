@@ -105,30 +105,6 @@ The resolved config for each run is saved as:
 <output-dir>/results/resolved_config.json
 ```
 
-## Reproducibility Checks
-
-Compare a minimal clean run against the original repository:
-
-```bash
-bash scripts/run_integrity_compare.sh \
-  --original-root /home/hyunjin/latent_planning \
-  --clean-root /home/hyunjin/latent_planning_paper_clean \
-  --dataset-dir /home/hyunjin/latent_planning/data/cloze_llm_improved_split_ratio_0.1 \
-  --config configs/presets/integrity_qwen3_4b_single.json
-```
-
-The integrity script writes JSON and Markdown reports under its temporary work directory.
-
-Explain which tracked files are required by the retained presets:
-
-```bash
-uv run python scripts/audit/necessity_inventory.py \
-  --config configs/default.json \
-  --config configs/presets/ambigqa_qwen3_4b.json
-```
-
-Generated outputs, logs, caches, virtual environments, and large result directories are intentionally not tracked.
-
 ## Project Layout
 
 - `configs/`: base config, default config, and tracked reproduction presets.
@@ -138,13 +114,3 @@ Generated outputs, logs, caches, virtual environments, and large result director
 - `inputs/`: small example prefix input for smoke checks.
 - `tests/`: unit tests for config resolution, pipeline command construction, and necessity inventory.
 - `docs/`: project page assets preserved from the deployment repository.
-
-## Paper Status
-
-This repository accompanies the ICML 2026 paper draft:
-
-**Shared Semantics, Divergent Mechanisms: Unsupervised Feature Discovery by Aligning Semantics and Mechanisms**
-
-Hyunjin Cho, Youngji Roh, and Jaehyung Kim
-
-The final citation metadata can be added once the paper record is finalized.
