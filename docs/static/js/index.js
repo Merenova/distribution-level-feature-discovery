@@ -243,7 +243,6 @@ function updateRdTrace(widget, state, trace) {
   const slider = widget.querySelector('.rd-trace-slider');
   const iterationLabel = widget.querySelector('[data-rd-iteration-label]');
   const stageTabs = widget.querySelector('.rd-stage-tabs');
-  const selectedText = widget.querySelector('[data-rd-selected]');
   const noteText = widget.querySelector('[data-rd-note]');
 
   widget.querySelectorAll('.rd-mode-tab').forEach((button) => {
@@ -298,12 +297,6 @@ function updateRdTrace(widget, state, trace) {
     const metricKey = metricNode.dataset.rdMetric;
     metricNode.textContent = formatRdMetric(metricKey, activeFrame.metrics[metricKey]);
   });
-
-  if (selectedText) {
-    const betaText = Number(trace.beta).toFixed(2);
-    const gammaText = Number(trace.gamma).toFixed(2);
-    selectedText.textContent = `Beta ${betaText}, Gamma ${gammaText}.`;
-  }
 
   if (noteText) {
     noteText.textContent = activeFrame.operation_note;

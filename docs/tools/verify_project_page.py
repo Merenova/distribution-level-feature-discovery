@@ -386,7 +386,6 @@ def main():
         "data-rd-trace=\"static/data/rd/traces/cloze_0097_beta_0_50_gamma_0_60/rd_iteration_trace.json\"",
         "Animation",
         "Still",
-        "Gamma",
         "RD objective",
         "Semantic distortion",
         "Mechanistic distortion",
@@ -396,6 +395,9 @@ def main():
     for required in required_rd_trace_copy:
         if required not in html:
             fail(f"RD trace copy or markup missing: {required}")
+    for hidden in ("Beta 0.50", "Gamma 0.60", "data-rd-selected"):
+        if hidden in html:
+            fail(f"RD trace metrics should hide beta/gamma display: {hidden}")
     required_reader_copy = [
         "Lay summary",
         "When an AI model answers a question, there is usually more than one reasonable response it could give.",
@@ -579,7 +581,6 @@ def main():
         "TRACE_PATH_BY_GAMMA",
         "'0.60': 'static/data/rd/traces/cloze_0097_beta_0_50_gamma_0_60/rd_iteration_trace.json'",
         "resolveRdTracePath",
-        "trace.beta",
         "gamma",
         "rd-trace-slider",
         "rd-stage-tab",
