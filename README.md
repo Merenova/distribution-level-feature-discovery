@@ -4,6 +4,11 @@ This repository contains the cleaned reproduction code for **Shared Semantics, D
 
 The default reproduction setting is **AmbigQA + Qwen3-8B**. The configuration system is flexible, so AmbigQA and Qwen3-8B are defaults rather than hard-coded assumptions.
 
+## Links
+
+- [Paper](https://arxiv.org/abs/2606.08236)
+- [Project page](https://merenova.github.io/distribution-level-feature-discovery/)
+
 ## What This Repository Reproduces
 
 - The paper-clean AmbigQA + Qwen3-8B pipeline.
@@ -114,3 +119,7 @@ The resolved config for each run is saved as:
 - `inputs/`: small example prefix input for smoke checks.
 - `tests/`: unit tests for config resolution, pipeline command construction, and necessity inventory.
 - `docs/`: project page assets preserved from the deployment repository.
+
+## Attribution
+
+Some attribution and circuit-tracing code was adapted from [decoderesearch/circuit-tracer](https://github.com/decoderesearch/circuit-tracer). Please refer to the upstream project for its original implementation and license.
