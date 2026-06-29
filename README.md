@@ -110,6 +110,17 @@ The resolved config for each run is saved as:
 <output-dir>/results/resolved_config.json
 ```
 
+## Stages
+
+- `0_preprocess`: loads AmbigQA data and writes grouped question records for the selected split. This runs only in `--dataset-dir` mode.
+- `1_data_preparation`: formats the grouped AmbigQA questions into model-ready prefixes. This also runs only in `--dataset-dir` mode.
+- `2_branch_sampling`: samples continuations from the configured language model for each prefix.
+- `3_attribution_graphs`: computes continuation-level mechanistic attribution signatures with the configured transcoder.
+- `4_feature_extraction`: computes semantic embeddings for the sampled continuations.
+- `5_clustering`: runs rate-distortion clustering over the semantic and attribution views.
+- `6_semantic_graphs`: extracts cluster-level semantic graph summaries from the clustering outputs.
+- `7_validation`: runs steering and baseline analyses, then aggregates validation summaries.
+
 ## Project Layout
 
 - `configs/`: base config, default config, and tracked reproduction presets.
