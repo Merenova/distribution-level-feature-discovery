@@ -1,3 +1,50 @@
+# Friendly README Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Rewrite the root README so it introduces the paper, explains the cleaned reproduction repository, and keeps reproduction commands easy to run.
+
+**Architecture:** This is a documentation-only change. `README.md` remains the single public entry point, while the existing configs, scripts, stages, tests, and `docs/` project page are referenced but not modified.
+
+**Tech Stack:** Markdown, existing shell scripts, `uv`, Python `unittest`.
+
+---
+
+## File Structure
+
+- Modify: `README.md`
+  - Responsibility: public-facing overview, quick start, configuration, outputs, reproducibility checks, and paper status.
+- Leave unchanged: `configs/`, `scripts/`, stage directories, `tests/`, `docs/`, and all Python code.
+  - Responsibility: existing implementation and project page behavior.
+
+## Constraints
+
+- Keep AmbigQA and Qwen3-8B as the documented defaults.
+- Present dataset/model choices as flexible configuration, not hard-coded assumptions.
+- Mention the paper title and authors without claiming final acceptance metadata.
+- Preserve the existing operational commands: dry run, default run, preset run, integrity audit, and necessity audit.
+- Do not add new dependencies or hidden prerequisites.
+
+### Task 1: Rewrite Root README
+
+**Files:**
+- Modify: `README.md`
+
+- [ ] **Step 1: Read the current README**
+
+Run:
+
+```bash
+sed -n '1,240p' README.md
+```
+
+Expected: the current README starts with `# RD Clustering Paper-Clean Implementation` and contains sections for default run, presets, outputs, integrity audit, and necessity audit.
+
+- [ ] **Step 2: Replace `README.md` with the friendly paper-first version**
+
+Use this exact content:
+
+```markdown
 # Distribution-Level Feature Discovery
 
 This repository contains the cleaned reproduction code for **Shared Semantics, Divergent Mechanisms: Unsupervised Feature Discovery by Aligning Semantics and Mechanisms**. The paper studies distribution-level feature discovery for language model continuations: instead of explaining one hand-picked target answer, it samples many possible continuations for a prompt, represents each continuation with both semantic embeddings and sequence-level mechanistic attribution signatures, and clusters them with a rate-distortion objective.
@@ -148,3 +195,116 @@ This repository accompanies the ICML 2026 paper draft:
 Hyunjin Cho, Youngji Roh, and Jaehyung Kim
 
 The final citation metadata can be added once the paper record is finalized.
+```
+
+- [ ] **Step 3: Review the rewritten README**
+
+Run:
+
+```bash
+sed -n '1,260p' README.md
+```
+
+Expected:
+
+- The title is `# Distribution-Level Feature Discovery`.
+- The first section mentions the paper title.
+- The quick start contains dry-run, default, Qwen3-4B preset, and prefix smoke-check commands.
+- The README still documents integrity and necessity audits.
+
+### Task 2: Verify Paths, Commands, And Tests
+
+**Files:**
+- Read: `README.md`
+- Read: existing referenced files and directories
+
+- [ ] **Step 1: Check referenced repository paths exist**
+
+Run:
+
+```bash
+for path in \
+  configs/default.json \
+  configs/presets/ambigqa_qwen3_8b.json \
+  configs/presets/ambigqa_qwen3_4b.json \
+  configs/presets/integrity_qwen3_4b_single.json \
+  scripts/run_paper_pipeline.sh \
+  scripts/run_integrity_compare.sh \
+  scripts/audit/necessity_inventory.py \
+  inputs/prefixes.example.json \
+  tests \
+  docs \
+  0_preprocess \
+  1_data_preparation \
+  2_branch_sampling \
+  3_attribution_graphs \
+  4_feature_extraction \
+  5_gaussian_clustering \
+  6_semantic_graphs \
+  7_validation
+do
+  test -e "$path" || { echo "missing $path"; exit 1; }
+done
+```
+
+Expected: command exits with status 0 and prints nothing.
+
+- [ ] **Step 2: Run the dry-run command documented in the README**
+
+Run:
+
+```bash
+bash scripts/run_paper_pipeline.sh \
+  --dry-run \
+  --prefixes-file inputs/prefixes.example.json \
+  --output-dir /tmp/lp_dry_run
+```
+
+Expected: command exits with status 0 and prints planned stage commands without launching model work.
+
+- [ ] **Step 3: Run the existing test suite**
+
+Run:
+
+```bash
+uv run python -m unittest discover -s tests -v
+```
+
+Expected: all existing tests pass.
+
+### Task 3: Commit And Push README Work
+
+**Files:**
+- Modify: `README.md`
+- Create: `docs/superpowers/plans/2026-06-29-friendly-readme.md`
+
+- [ ] **Step 1: Check the final diff**
+
+Run:
+
+```bash
+git diff -- README.md docs/superpowers/plans/2026-06-29-friendly-readme.md
+```
+
+Expected: diff only contains the README rewrite and this implementation plan.
+
+- [ ] **Step 2: Commit the README update and plan**
+
+Run:
+
+```bash
+git add README.md docs/superpowers/plans/2026-06-29-friendly-readme.md
+git commit -m "Improve README for paper reproduction"
+```
+
+Expected: commit succeeds.
+
+- [ ] **Step 3: Push to origin**
+
+Run:
+
+```bash
+git push origin main
+```
+
+Expected: push succeeds and includes the previous design-spec commit plus the README update commit.
