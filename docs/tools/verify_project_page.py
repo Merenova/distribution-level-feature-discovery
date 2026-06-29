@@ -507,6 +507,8 @@ def main():
             fail(f"reader-facing copy missing: {required}")
     if "What to notice:" in html or "Takeaway:" in html:
         fail("old repeated caption lead should be replaced with figure-specific labels")
+    if "RD is stronger because its medoid is selected from continuations" in html:
+        fail("steering implication should not include the removed RD medoid sentence")
     if 'class="results-strip"' in html:
         fail("Causal Validation should use paragraph introduction, not the removed three-card results strip")
     removed_steering_grid_refs = [
