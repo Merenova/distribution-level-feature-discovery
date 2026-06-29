@@ -1,24 +1,22 @@
 [project]
 name = "circuit-tracer"
-version = "0.4.1"
+version = "0.1.0"
 description = "Library for circuit tracing in language models"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "einops>=0.8.0",
-    "huggingface_hub<1.0.0",
-    "ipykernel>=6.29.5,<7.0.0",
+    "huggingface_hub>=0.26.0",
+    "ipykernel>=6.29.5",
     "ipywidgets>=8.1.7",
-    "nnsight==0.6.1",
     "numpy>=1.24.0",
     "pydantic>=2.0.0",
     "safetensors>=0.5.0",
-    "seaborn>=0.13.2",
     "tokenizers>=0.21.0",
     "torch>=2.0.0",
     "tqdm>=4.60.0",
-    "transformer-lens>=2.16.0",
-    "transformers>=4.56.0,<=4.57.3",
+    "transformer-lens>=v2.16.0",
+    "transformers>=4.50.0",
 ]
 
 [project.optional-dependencies]
@@ -34,7 +32,6 @@ build-backend = "hatchling.build"
 [tool.ruff]
 line-length = 100
 exclude = ["*.ipynb", "demos"]
-ignore = ["E501"]
 
 [tool.ruff.lint]
 select = [
@@ -53,13 +50,3 @@ select = [
 [tool.pyright]
 typeCheckingMode = "basic"
 exclude = ["**/node_modules", "**/__pycache__", "**/.*", "demos"]
-
-[tool.pytest.ini_options]
-markers = [
-    "requires_disk: marks tests requiring storage space",
-]
-
-[dependency-groups]
-dev = [
-    "pytest>=8.4.2",
-]

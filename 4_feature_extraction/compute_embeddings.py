@@ -30,7 +30,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils.config import PathConfig, EmbeddingConfig
 from utils.data_utils import load_json, save_json
 from utils.logging_utils import setup_logger
-from utils.manifest import filter_samples_by_manifest, update_manifest_with_results
 
 
 def embed_continuations_for_prefix(
@@ -264,7 +263,7 @@ def main():
         "--output-dir",
         type=Path,
         default=None,
-        help="Output directory (default: 3_feature_extraction/embeddings/)"
+        help="Output directory (default: results/4_feature_extraction/)"
     )
     parser.add_argument(
         "--quiet",
@@ -278,7 +277,7 @@ def main():
     paths.ensure_dirs()
 
     if args.output_dir is None:
-        args.output_dir = paths.feature_extraction / "embeddings"
+        args.output_dir = paths.results_feature_extraction
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     # Setup logger
@@ -286,7 +285,7 @@ def main():
     log_level = logging.WARNING if args.quiet else logging.INFO
     logger = setup_logger(
         "compute_embeddings",
-        log_file=paths.feature_extraction / "compute_embeddings.log",
+        log_file=paths.logs / "compute_embeddings.log",
         level=log_level
     )
 
@@ -326,18 +325,7 @@ def main():
         logger.warning("Expected files matching pattern: *_branches.json")
         return
 
-    # Filter branch files based on Stage 3 manifest
-    # Derive results_dir from samples_dir to respect --output-dir
-    # samples_dir is typically {output_dir}/results/2_branch_sampling/
-    results_dir = args.samples_dir.parent
-    all_prefix_ids = [f.stem.replace("_branches", "") for f in branch_files]
-    available_ids, skipped_ids = filter_samples_by_manifest(
-        all_prefix_ids, results_dir, "stage3", logger
-    )
-    # Filter branch files to only available ones
-    available_id_set = set(available_ids)
-    branch_files = [f for f in branch_files if f.stem.replace("_branches", "") in available_id_set]
-    logger.info(f"Processing {len(branch_files)} available files (skipped {len(skipped_ids)})")
+    logger.info(f"Processing {len(branch_files)} branch files")
 
     # Process each file
     logger.info("\n" + "=" * 60)
@@ -380,22 +368,11 @@ def main():
     index_file = args.output_dir / "embeddings_index.json"
     save_json(index_data, index_file)
 
-    # Write Stage 4a manifest (embeddings)
-    update_manifest_with_results(
-        results_dir=results_dir,
-        stage_name="stage4a",
-        processed=completed_ids,
-        failed=failed_ids,
-        skipped=skipped_ids,
-        logger=logger,
-        errors=errors,
-    )
-
     logger.info("=" * 60)
     logger.info("COMPLETE")
     logger.info("=" * 60)
     logger.info(f"Processed {len(completed_ids)} files")
-    logger.info(f"Completed: {len(completed_ids)}, Failed: {len(failed_ids)}, Skipped: {len(skipped_ids)}")
+    logger.info(f"Completed: {len(completed_ids)}, Failed: {len(failed_ids)}")
     logger.info(f"Output directory: {args.output_dir}")
     logger.info(f"Index file: {index_file}")
 

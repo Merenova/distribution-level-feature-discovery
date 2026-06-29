@@ -27,9 +27,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils.config import PathConfig, SamplingConfig
 from utils.data_utils import load_json, save_json
 from utils.logging_utils import setup_logger
-from utils.manifest import filter_samples_by_manifest, update_manifest_with_results
-
-
 class SkipPrefixError(Exception):
     """Raised when a prefix should be skipped (not a failure, just filtered out)."""
     pass
@@ -81,7 +78,7 @@ def deduplicate_continuations(samples: List[Dict[str, Any]]) -> List[Continuatio
 
 def build_prefix_tokens_with_bos(prefix: str, tokenizer) -> List[int]:
     """Build prefix token IDs including BOS at position 0."""
-    tokens = tokenizer(prefix, return_tensors="pt", add_special_tokens=False).input_ids
+    tokens = tokenizer(prefix, return_tensors="pt").input_ids
     token_ids_list = tokens[0].tolist()
 
     bos_id = tokenizer.bos_token_id
@@ -93,14 +90,6 @@ def build_prefix_tokens_with_bos(prefix: str, tokenizer) -> List[int]:
     if token_ids_list and token_ids_list[0] == bos_id:
         return token_ids_list
     return [bos_id] + token_ids_list
-
-
-def build_vllm_token_prompt(prefix: str, prompt_token_ids: List[int]) -> Dict[str, Any]:
-    """Build a vLLM token prompt that bypasses tokenizer special-token defaults."""
-    return {
-        "prompt": prefix,
-        "prompt_token_ids": list(prompt_token_ids),
-    }
 
 
 def extract_logprob_for_token(logprob_entry: Any, token_id: int) -> Optional[float]:
@@ -132,7 +121,6 @@ def compute_temp1_logprobs(
     logger,
     batch_size: int,
     skip_rescore: bool = False,
-    prefix_token_ids: Optional[List[int]] = None,
 ) -> None:
     """Rescore continuations with temperature=1.0 using prompt logprobs."""
     if not continuations:
@@ -154,19 +142,12 @@ def compute_temp1_logprobs(
         logger.warning("prompt_logprobs not supported in this vLLM version; skipping temp=1.0 scoring")
         return
 
-    prefix_ids = (
-        list(prefix_token_ids)
-        if prefix_token_ids is not None
-        else build_prefix_tokens_with_bos(prefix, tokenizer)
-    )
+    prefix_ids = build_prefix_tokens_with_bos(prefix, tokenizer)
     score_batch_size = max(1, min(64, batch_size))
 
     for i in range(0, len(continuations), score_batch_size):
         batch = continuations[i:i + score_batch_size]
-        prompts = [
-            build_vllm_token_prompt(prefix + cont.text, prefix_ids + cont.token_ids)
-            for cont in batch
-        ]
+        prompts = [prefix + cont.text for cont in batch]
         outputs = llm.generate(prompts, scoring_params, use_tqdm=False)
 
         for j, (cont, out) in enumerate(zip(batch, outputs)):
@@ -178,16 +159,24 @@ def compute_temp1_logprobs(
                 cont.probability = 0.0
                 continue
 
-            full_ids = prefix_ids + cont.token_ids
+            full_ids = build_prefix_tokens_with_bos(prefix + cont.text, tokenizer)
             start_idx = len(prefix_ids)
+
+            # If prefix tokenization doesn't align, fall back to tokenization without BOS.
+            if full_ids[:start_idx] != prefix_ids:
+                prefix_ids_no = tokenizer(prefix, return_tensors="pt").input_ids[0].tolist()
+                full_ids_no = tokenizer(prefix + cont.text, return_tensors="pt").input_ids[0].tolist()
+                if full_ids_no[:len(prefix_ids_no)] == prefix_ids_no:
+                    full_ids = full_ids_no
+                    start_idx = len(prefix_ids_no)
 
             logprob_sum = 0.0
             n_tokens = 0
-            # vLLM stores a placeholder for the first prompt token, then each
-            # prompt_logprobs[i] corresponds to full_ids[i].
-            max_idx = min(len(full_ids), len(prompt_logprobs))
+            # prompt_logprobs[i] corresponds to full_ids[i+1] (first entry for BOS is excluded)
+            # So for full_ids[idx], look at prompt_logprobs[idx - 1]
+            max_idx = min(len(full_ids), len(prompt_logprobs) + 1)
             for idx in range(start_idx, max_idx):
-                logprob_idx = idx
+                logprob_idx = idx - 1
                 if logprob_idx < 0 or logprob_idx >= len(prompt_logprobs):
                     continue
                 lp = extract_logprob_for_token(prompt_logprobs[logprob_idx], full_ids[idx])
@@ -216,7 +205,6 @@ def compute_temp1_logprobs(
 def sample_continuations_natural(
     llm: LLM,
     prefix: str,
-    prefix_token_ids: Optional[List[int]],
     sampling_config: SamplingConfig,
     max_total_continuations: Optional[int],
     max_batches: int,
@@ -227,7 +215,6 @@ def sample_continuations_natural(
     Args:
         llm: vLLM LLM instance
         prefix: Prefix text
-        prefix_token_ids: Tokenized prefix to pass directly to vLLM when available
         sampling_config: Sampling configuration
         max_total_continuations: Maximum number of distinct continuations to keep (None = no cap)
         max_batches: Maximum batches to sample
@@ -251,15 +238,10 @@ def sample_continuations_natural(
         stop=sampling_config.stop_tokens,
         logprobs=1,  # Minimal logprobs for fallback logprob calculation
     )
-    prompt_input: Any = (
-        build_vllm_token_prompt(prefix, prefix_token_ids)
-        if prefix_token_ids is not None
-        else prefix
-    )
 
     for batch_idx in range(max_batches):
         # Generate batch
-        outputs = llm.generate([prompt_input], sampling_params, use_tqdm=False)
+        outputs = llm.generate([prefix], sampling_params, use_tqdm=False)
         if not outputs:
             break
 
@@ -385,7 +367,7 @@ def process_prefix(
 
     target_total = max_total_continuations if max_total_continuations and max_total_continuations > 0 else None
     continuations, num_samples = sample_continuations_natural(
-        llm, prefix, prefix_tokens_with_bos, sampling_config, target_total, max_batches * 10, logger
+        llm, prefix, sampling_config, target_total, max_batches * 10, logger
     )
     
     logger.info(f"Sampled {len(continuations)} natural continuations")
@@ -400,7 +382,6 @@ def process_prefix(
             logger=logger,
             batch_size=sampling_config.batch_size,
             skip_rescore=skip_rescore,
-            prefix_token_ids=prefix_tokens_with_bos,
         )
     
     # Step 3: Construct Output Format
@@ -429,13 +410,39 @@ def process_prefix(
     return output_file, total_continuations_so_far
 
 
+def load_prefix_entries(prefixes_file: Path) -> List[Dict[str, str]]:
+    """Load paper-style prefix entries from JSON."""
+    raw = load_json(prefixes_file)
+    if not isinstance(raw, list):
+        raise ValueError(f"Expected a list in {prefixes_file}")
+
+    entries: List[Dict[str, str]] = []
+    for idx, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ValueError(f"Entry {idx} must be an object")
+
+        prefix = entry.get("prefix")
+        if not isinstance(prefix, str) or not prefix.strip():
+            raise ValueError(f"Entry {idx} is missing a non-empty 'prefix'")
+
+        prefix_id = entry.get("prefix_id") or f"cloze_{idx:04d}"
+        entries.append(
+            {
+                "prefix_id": str(prefix_id),
+                "prefix": prefix,
+            }
+        )
+
+    return entries
+
+
 def main():
     parser = argparse.ArgumentParser(description="Sample branch continuations for prefixes")
     parser.add_argument(
-        "--test-clozes",
+        "--prefixes-file",
         type=Path,
         required=True,
-        help="Path to test clozes JSON file"
+        help="Path to a JSON list of {prefix_id, prefix} entries"
     )
     parser.add_argument(
         "--model",
@@ -484,7 +491,7 @@ def main():
         "--output-dir",
         type=Path,
         default=None,
-        help="Output directory (default: 2_branch_sampling/samples/)"
+        help="Output directory (default: results/2_branch_sampling/)"
     )
     parser.add_argument(
         "--gpu-memory-utilization",
@@ -520,12 +527,6 @@ def main():
         action="store_true",
         help="Skip temperature=1.0 rescoring (faster, uses original sampling logprobs)"
     )
-    parser.add_argument(
-        "--max-complete",
-        type=int,
-        default=None,
-        help="Stop after this many prefixes reach max_total_continuations (None = process all)"
-    )
     args = parser.parse_args()
 
     # Setup paths
@@ -533,7 +534,7 @@ def main():
     paths.ensure_dirs()
 
     if args.output_dir is None:
-        args.output_dir = paths.branch_sampling / "samples"
+        args.output_dir = paths.results_branch_sampling
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     # Setup logger
@@ -541,14 +542,14 @@ def main():
     log_level = logging.WARNING if args.quiet else logging.INFO
     logger = setup_logger(
         "branch_sampling",
-        log_file=paths.branch_sampling / "sample_branches.log",
+        log_file=paths.logs / "sample_branches.log",
         level=log_level
     )
 
     logger.info("=" * 60)
     logger.info("BRANCH SAMPLING")
     logger.info("=" * 60)
-    logger.info(f"Test clozes: {args.test_clozes}")
+    logger.info(f"Prefixes file: {args.prefixes_file}")
     logger.info(f"Model: {args.model}")
     logger.info(f"Continuation sampling:")
     logger.info(f"  Max total continuations: {args.max_total_continuations}")
@@ -557,26 +558,12 @@ def main():
     logger.info(f"  Batch size: {args.batch_size}")
     logger.info(f"Output directory: {args.output_dir}")
 
-    # Load test clozes
-    logger.info("\nLoading test clozes...")
-    test_data = load_json(args.test_clozes)
-    clozes = test_data["clozes"]
-    logger.info(f"Loaded {len(clozes)} test clozes")
-
-    # Filter samples based on Stage 1 manifest (data preparation)
-    results_dir = paths.results
-    all_cloze_ids = [c.get("cloze_id") or c.get("id") for c in clozes]
-    available_ids, skipped_ids = filter_samples_by_manifest(
-        all_cloze_ids, results_dir, "stage1", logger
-    )
-    # Filter clozes to only available ones
-    available_id_set = set(available_ids)
-    clozes = [c for c in clozes if (c.get("cloze_id") or c.get("id")) in available_id_set]
-    logger.info(f"Processing {len(clozes)} available clozes (skipped {len(skipped_ids)})")
+    logger.info("\nLoading prefixes...")
+    prefixes = load_prefix_entries(args.prefixes_file)
+    logger.info(f"Loaded {len(prefixes)} prefixes")
 
     # Setup sampling configuration
     sampling_config = SamplingConfig(
-        n_samples=args.batch_size,  # Batch size
         nucleus_p=args.nucleus_p,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
@@ -615,19 +602,12 @@ def main():
     output_files = []
     completed_ids = []
     failed_ids = []
-    filtered_ids = []  # Prefixes filtered due to SkipPrefixError
     errors = {}
     
-    for idx, cloze in enumerate(tqdm(clozes, desc="Processing prefixes")):
-        prefix_id = cloze.get("id") or cloze.get("cloze_id") or f"cloze_{idx:03d}"
+    for entry in tqdm(prefixes, desc="Processing prefixes"):
+        prefix_id = entry["prefix_id"]
+        prefix = entry["prefix"]
 
-        # Extract prefix from cloze
-        if isinstance(cloze, dict):
-            prefix = cloze.get('prefix', cloze.get('text', str(cloze)))
-        else:
-            prefix = str(cloze)
-
-        # Process prefix
         try:
             output_file, n_continuations = process_prefix(
                 prefix, prefix_id, llm, tokenizer,
@@ -645,14 +625,8 @@ def main():
                 errors[prefix_id] = f"Low diversity: only {n_continuations}/{args.max_total_continuations} continuations found"
             else:
                 completed_ids.append(prefix_id)
-                # Check if we've reached the max-complete target
-                if args.max_complete and len(completed_ids) >= args.max_complete:
-                    logger.info(f"Reached --max-complete target: {len(completed_ids)} complete prefixes")
-                    break
         except SkipPrefixError as e:
-        # Filtered out due to sample constraints
             logger.info(f"Skipping {prefix_id}: {str(e)}")
-            filtered_ids.append(prefix_id)
         except Exception as e:
             error_msg = f"{type(e).__name__}: {str(e)}"
             logger.error(f"Failed to process {prefix_id}: {error_msg}")
@@ -666,7 +640,8 @@ def main():
     # Save index of all output files
     index_data = {
         "model": args.model,
-        "n_prefixes": len(clozes),
+        "prefixes_file": str(args.prefixes_file),
+        "n_prefixes": len(prefixes),
         "max_total_continuations": args.max_total_continuations,
         "sampling_config": {
             "nucleus_p": args.nucleus_p,
@@ -680,27 +655,12 @@ def main():
     index_file = args.output_dir / "branches_index.json"
     save_json(index_data, index_file)
 
-    # Combine skipped (from previous stage) and filtered (low diversity) for manifest
-    # Both should be excluded from downstream processing
-    all_skipped_ids = skipped_ids + filtered_ids
-    update_manifest_with_results(
-        results_dir=results_dir,
-        stage_name="stage2",
-        processed=completed_ids,
-        failed=failed_ids,
-        skipped=all_skipped_ids,
-        logger=logger,
-        errors=errors,
-    )
-
     logger.info("=" * 60)
     logger.info("COMPLETE")
     logger.info("=" * 60)
-    logger.info(f"Processed {len(completed_ids)}/{len(clozes)} prefixes successfully")
+    logger.info(f"Processed {len(completed_ids)}/{len(prefixes)} prefixes successfully")
     logger.info(f"  Completed: {len(completed_ids)} (reached {args.max_total_continuations} continuations)")
     logger.info(f"  Failed: {len(failed_ids)} (low diversity or error)")
-    logger.info(f"  Filtered: {len(filtered_ids)}")
-    logger.info(f"  Skipped (stage1): {len(skipped_ids)}")
     logger.info(f"Output directory: {args.output_dir}")
     logger.info(f"Index file: {index_file}")
 

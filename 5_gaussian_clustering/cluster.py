@@ -25,14 +25,11 @@ from typing import Dict, List, Any, Optional
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
+import torch
 
 # Use 'spawn' start method for CUDA compatibility with multiprocessing
 _mp_context = multiprocessing.get_context('spawn')
 from tqdm import tqdm
-
-# Add local clustering modules to path for direct module imports in tests
-CLUSTERING_PATH = Path(__file__).resolve().parent
-sys.path.insert(0, str(CLUSTERING_PATH))
 
 # Add circuit-tracer to path (relative to project root)
 CIRCUIT_TRACER_PATH = Path(__file__).resolve().parents[1] / "circuit-tracer"
@@ -41,11 +38,8 @@ sys.path.insert(0, str(CIRCUIT_TRACER_PATH))
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# PathConfig removed - results_dir now derived from embeddings_dir
 from utils.data_utils import load_json, save_json
-from utils.attribution_pooling import load_pooled_attributions
 from utils.logging_utils import setup_logger, get_log_path
-from utils.manifest import update_manifest_with_results
 
 # Import R-D clustering modules
 from initialize import initialize_single_component
@@ -59,11 +53,6 @@ from rd_objective import (
 )
 
 from sweep_utils import run_sweep_mode
-
-
-def _resolve_pooling(cli_pooling: Optional[str], config: Dict[str, Any]) -> str:
-    """Resolve attribution pooling with CLI taking precedence over config."""
-    return cli_pooling or config.get("pooling", "mean") or "mean"
 
 
 def compute_global_center(
@@ -92,7 +81,6 @@ def load_prefix_data(
     attribution_graphs_dir: Path,
     samples_dir: Path,
     logger,
-    pooling: str = "mean",
     metric_a: str = "l2",
 ):
     """Load all data for a single prefix."""
@@ -122,17 +110,9 @@ def load_prefix_data(
 
     logger.info("Loading continuation attribution from Stage 3...")
     prefix_context_file = attribution_graphs_dir / f"{prefix_id}_prefix_context.pt"
-    pooled_attributions = load_pooled_attributions(
-        prefix_context_file,
-        pooling=pooling,
-        meta_file=attribution_graphs_dir / f"{prefix_id}_attribution.json",
-    )
-    attributions_a = pooled_attributions.values
-
-    if logger.getEffectiveLevel() <= logging.INFO:
-        logger.info(f"  Pooling requested: {pooled_attributions.requested_pooling}")
-        logger.info(f"  Pooling effective: {pooled_attributions.effective_pooling}")
-        logger.info(f"  Attribution source: {pooled_attributions.source}")
+    context_data = torch.load(prefix_context_file, weights_only=False)
+    attributions_a = context_data["aggregated_attributions"].float().numpy()
+    logger.info("Using full-continuation aggregated attributions from Stage 3")
 
     logger.info(f"Loaded continuation attributions: shape {attributions_a.shape}")
 
@@ -550,6 +530,61 @@ def serialize_clustering_result(result: dict) -> dict:
     }
 
 
+def compact_sweep_results(
+    sweep_results: Dict[str, Any],
+    metric_a: str,
+    max_iterations: int,
+    convergence_threshold: float,
+) -> Dict[str, Any]:
+    """Reduce sweep results to the fields used by the paper pipeline."""
+    compact_grid = []
+    for entry in sweep_results.get("grid", []):
+        compact_entry = {
+            "beta": float(entry.get("beta", 0.0)),
+            "gamma": float(entry.get("gamma", 0.0)),
+        }
+        if "error" in entry:
+            compact_entry["error"] = entry["error"]
+            compact_grid.append(compact_entry)
+            continue
+
+        compact_entry["K"] = int(entry.get("K", len(entry.get("components", {}))))
+        compact_entry["rd_objective"] = {
+            "L_RD": float(entry.get("L_RD", 0.0)),
+            "H": float(entry.get("H", 0.0)),
+            "D_e": float(entry.get("D_e", 0.0)),
+            "D_a": float(entry.get("D_a", 0.0)),
+            "beta_e": float(entry.get("beta_e", 0.0)),
+            "beta_a": float(entry.get("beta_a", 0.0)),
+        }
+        compact_entry["components"] = {
+            str(component_id): {
+                "mu_e": comp.get("mu_e"),
+                "mu_a": comp.get("mu_a"),
+                "W_c": float(comp.get("W_c", 0.0)),
+            }
+            for component_id, comp in entry.get("components", {}).items()
+        }
+        compact_entry["assignments"] = [int(a) for a in entry.get("assignments", [])]
+        compact_grid.append(compact_entry)
+
+    raw_config = sweep_results.get("sweep_config", {}) or {}
+    return {
+        "prefix_id": sweep_results.get("prefix_id"),
+        "prefix": sweep_results.get("prefix"),
+        "H_0": sweep_results.get("H_0"),
+        "sweep_config": {
+            "beta_values": raw_config.get("beta_values", []),
+            "gamma_values": raw_config.get("gamma_values", []),
+            "K_clamp": raw_config.get("K_clamp", raw_config.get("K_max")),
+            "attribution_metric": metric_a,
+            "max_iterations": int(max_iterations),
+            "convergence_threshold": float(convergence_threshold),
+        },
+        "grid": compact_grid,
+    }
+
+
 def process_prefix(meta_file, args, sweeps_config, n_sweep_workers):
     """Process a single prefix (load data, run clustering/sweep, save results)."""
     prefix_id = meta_file.stem.replace("_embeddings_meta", "")
@@ -566,7 +601,6 @@ def process_prefix(meta_file, args, sweeps_config, n_sweep_workers):
             args.attribution_graphs_dir,
             args.samples_dir,
             logger,
-            pooling=args.pooling,
             metric_a=args.attribution_metric,
         )
 
@@ -575,7 +609,7 @@ def process_prefix(meta_file, args, sweeps_config, n_sweep_workers):
             intermediate_dir = args.output_dir / "intermediate"
 
         # Sweep mode: run sweep over (beta, gamma) grid
-        sweep_results = run_sweep_mode(
+        raw_sweep_results = run_sweep_mode(
             data,
             sweeps_config,
             args.K_max,
@@ -587,8 +621,14 @@ def process_prefix(meta_file, args, sweeps_config, n_sweep_workers):
             prefix_id=prefix_id,
             intermediate_dir=intermediate_dir,
             save_intermediate=args.save_intermediate,
-            normalize_dims=args.normalize_dims,
+            normalize_dims=False,
             K_clamp=getattr(args, 'K_clamp', None)
+        )
+        sweep_results = compact_sweep_results(
+            raw_sweep_results,
+            metric_a=args.attribution_metric,
+            max_iterations=args.max_iterations,
+            convergence_threshold=args.convergence_threshold,
         )
 
         # Save sweep results
@@ -633,19 +673,13 @@ def main():
     # R-D specific parameters
     parser.add_argument("--beta", type=float, default=2.0, help="Total β")
     parser.add_argument("--gamma", type=float, default=0.5, help="View ratio: β_e = γβ, β_a = (1-γ)β")
-    parser.add_argument("--K-max", type=int, default=20, 
-                        help="DEPRECATED: K_max no longer constrains clustering. "
-                             "Clustering converges naturally based on R-D criterion. "
-                             "This value is stored in sweep_config for downstream K_clamp filtering.")
+    parser.add_argument("--K-max", type=int, default=10,
+                        help="Maximum K recorded in the sweep metadata and used as the default K clamp.")
     parser.add_argument("--K-clamp", type=int, default=None,
-                        help="Maximum K for downstream steering (stored in sweep_config). "
-                             "If not provided, defaults to K_max value.")
+                        help="Maximum K retained for downstream steering metadata.")
     parser.add_argument("--max-iterations", type=int, default=50)
-    parser.add_argument("--convergence-threshold", type=float, default=1e-6)
+    parser.add_argument("--convergence-threshold", type=float, default=1e-3)
     parser.add_argument("--log-dir", type=Path, default=None, help="Directory for log files")
-    parser.add_argument("--pooling", type=str, default=None,
-                        choices=["mean", "max", "sum"],
-                        help="Pooling method for aggregating token attributions (default: mean)")
     parser.add_argument("--n-workers", type=int, default=1, help="Number of workers for parallel prefix processing")
     parser.add_argument("--quiet", action="store_true", help="Quiet mode (only progress bars)")
     parser.add_argument("--save-intermediate", action="store_true",
@@ -653,12 +687,8 @@ def main():
     parser.add_argument("--intermediate-dir", type=Path, default=None,
                         help="Base directory for intermediate snapshots (default: output_dir/intermediate)")
     
-    # New Design Arguments
     parser.add_argument("--attribution-metric", type=str, default="l1", choices=["l2", "l1"],
                         help="Metric for attribution distance (default: l1)")
-    parser.add_argument("--normalize-dims", action="store_true",
-                        help="Normalize beta by dimensions: beta_e /= sqrt(d_e), beta_a /= d_a. "
-                             "This accounts for L2 scaling as sqrt(d) and L1 scaling as d.")
     parser.add_argument("--skip-existing", action="store_true",
                         help="Skip prefixes that already have *_sweep_results.json in output directory")
     args = parser.parse_args()
@@ -666,7 +696,6 @@ def main():
     # Load config if provided
     sweeps_config = {}
     n_sweep_workers = 4
-    clustering = {}
 
     if args.config and args.config.exists():
         with open(args.config) as f:
@@ -683,9 +712,7 @@ def main():
         args.max_iterations = clustering.get("max_iterations", args.max_iterations)
         args.convergence_threshold = clustering.get("convergence_threshold", args.convergence_threshold)
 
-        # Design arguments in config
         args.attribution_metric = clustering.get("attribution_metric", args.attribution_metric)
-        args.normalize_dims = clustering.get("normalize_dims", args.normalize_dims)
 
         # Worker config from config file (if provided)
         # Note: --n-workers cli arg overrides this for prefix parallelism
@@ -696,11 +723,9 @@ def main():
             sweeps_config = sweeps
             n_sweep_workers = sweeps.get("n_workers", 4)
 
-    args.pooling = _resolve_pooling(args.pooling, clustering)
-
     # Setup output directory
     if args.output_dir is None:
-        args.output_dir = Path("test_results")
+        args.output_dir = Path("results/5_clustering")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     # Setup main logger
@@ -730,7 +755,6 @@ def main():
     logger.info(f"K_max: {args.K_max}")
     logger.info(f"K_clamp: {args.K_clamp}")
     logger.info(f"Attribution Metric: {args.attribution_metric}")
-    logger.info(f"Dimension Normalization: {args.normalize_dims}")
     logger.info("Weighted Distortion: False")
     logger.info(f"GPU acceleration: {'enabled' if GPU_AVAILABLE else 'disabled'}")
 
@@ -738,22 +762,7 @@ def main():
     embedding_meta_files = sorted(args.embeddings_dir.glob("*_embeddings_meta.json"))
     logger.info(f"\nFound {len(embedding_meta_files)} prefixes to process")
 
-    # Filter based on Stage 4a manifest (embeddings extraction)
-    # Derive results_dir from embeddings_dir to respect --output-dir
-    # embeddings_dir is typically {output_dir}/results/4_feature_extraction/embeddings/
-    results_dir = args.embeddings_dir.parent.parent
-    # all_prefix_ids = [f.stem.replace("_embeddings_meta", "") for f in embedding_meta_files]
-    # available_ids, skipped_ids = filter_samples_by_manifest(
-    #     all_prefix_ids, results_dir, "stage4a", logger
-    # )
-    # # Filter embedding files to only available ones
-    # available_id_set = set(available_ids)
-    # embedding_meta_files = [f for f in embedding_meta_files if f.stem.replace("_embeddings_meta", "") in available_id_set]
-    # logger.info(f"Processing {len(embedding_meta_files)} available prefixes (skipped {len(skipped_ids)})")
-    
-    # SKIP MANIFEST CHECK FOR DESIGN CHECK
     skipped_ids = []
-    logger.info("Skipping manifest check for design check...")
 
     # Skip existing results if --skip-existing is set
     if args.skip_existing:
@@ -832,17 +841,6 @@ def main():
 
     summary_file = args.output_dir / "clustering_summary.json"
     save_json(summary, summary_file)
-
-    # Write Stage 5 manifest
-    update_manifest_with_results(
-        results_dir=results_dir,
-        stage_name="stage5",
-        processed=completed_ids,
-        failed=failed_ids,
-        skipped=skipped_ids,
-        logger=logger,
-        errors=errors,
-    )
 
     logger.info("=" * 60)
     logger.info("ALL PREFIXES COMPLETE")

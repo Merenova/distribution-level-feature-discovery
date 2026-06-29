@@ -1,0 +1,6 @@
+{
+  "extends": ["../base.json"],
+  "experiment_name": "ambigqa_qwen3_8b",
+  "model": {"base_model": "Qwen/Qwen3-8B", "transcoder": "mwhanna/qwen3-8b-transcoders", "dtype": "bfloat16", "device": "cuda"},
+  "stage_7c_steering": {"max_batch_size": 256}
+}

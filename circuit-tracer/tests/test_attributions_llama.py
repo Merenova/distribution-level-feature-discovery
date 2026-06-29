@@ -1,33 +1,17 @@
-import gc
-
 import numpy as np
 import pytest
 import torch
 import torch.nn as nn
 from transformer_lens import HookedTransformerConfig
 
-from circuit_tracer import ReplacementModel
-from circuit_tracer.attribution.attribute_transformerlens import attribute
-from circuit_tracer.replacement_model.replacement_model_transformerlens import (
-    TransformerLensReplacementModel,
-)
+from circuit_tracer import ReplacementModel, attribute
 from circuit_tracer.transcoder import SingleLayerTranscoder, TranscoderSet
 from circuit_tracer.transcoder.activation_functions import TopK
 from circuit_tracer.utils import get_default_device
-from tests.test_attributions_gemma import (
-    verify_feature_edges,
-    verify_token_and_error_edges,
-)
+from tests.test_attributions_gemma import verify_feature_edges, verify_token_and_error_edges
 
 
-@pytest.fixture(autouse=True)
-def cleanup_cuda():
-    yield
-    torch.cuda.empty_cache()
-    gc.collect()
-
-
-def load_dummy_llama_model(cfg: HookedTransformerConfig, k: int) -> TransformerLensReplacementModel:
+def load_dummy_llama_model(cfg: HookedTransformerConfig, k: int):
     transcoders = {
         layer_idx: SingleLayerTranscoder(
             cfg.d_model, cfg.d_model * 4, TopK(k), layer_idx, skip_connection=True
@@ -39,9 +23,7 @@ def load_dummy_llama_model(cfg: HookedTransformerConfig, k: int) -> TransformerL
             nn.init.uniform_(param, a=-1, b=1)
 
     transcoder_set = TranscoderSet(
-        transcoders,
-        feature_input_hook="mlp.hook_in",
-        feature_output_hook="mlp.hook_out",
+        transcoders, feature_input_hook="mlp.hook_in", feature_output_hook="mlp.hook_out"
     )
     model = ReplacementModel.from_config(cfg, transcoder_set)
     assert model.tokenizer is not None
@@ -51,12 +33,10 @@ def load_dummy_llama_model(cfg: HookedTransformerConfig, k: int) -> TransformerL
     for _, param in model.named_parameters():
         nn.init.uniform_(param, a=-1, b=1)
 
-    assert isinstance(model, TransformerLensReplacementModel)
     return model
 
 
-def test_small_llama_model():
-    s = torch.tensor([0, 3, 4, 3, 2, 5, 3, 8])
+def verify_small_llama_model(s: torch.Tensor):
     llama_small_cfg = {
         "n_layers": 2,
         "d_model": 8,
@@ -135,8 +115,7 @@ def test_small_llama_model():
     verify_feature_edges(model, graph)
 
 
-def test_large_llama_model():
-    s = torch.tensor([0, 113, 24, 53, 27])
+def verify_large_llama_model(s: torch.Tensor):
     llama_large_cfg = {
         "n_layers": 8,
         "d_model": 128,
@@ -146,7 +125,7 @@ def test_large_llama_model():
         "n_heads": 4,
         "d_mlp": 512,
         "act_fn": "silu",
-        "d_vocab": 256,
+        "d_vocab": 128,
         "eps": 1e-05,
         "use_attn_result": False,
         "use_attn_scale": True,
@@ -176,7 +155,7 @@ def test_large_llama_model():
         "scale_attn_by_inverse_layer_idx": False,
         "positional_embedding_type": "rotary",
         "final_rms": True,
-        "d_vocab_out": 256,
+        "d_vocab_out": 128,
         "parallel_attn_mlp": False,
         "rotary_dim": 32,
         "n_params": 1073741824,
@@ -214,33 +193,25 @@ def test_large_llama_model():
     verify_feature_edges(model, graph)
 
 
+def verify_llama_3_2_1b(s: str):
+    model = ReplacementModel.from_pretrained("meta-llama/Llama-3.2-1B", "llama")
+    graph = attribute(s, model, batch_size=128)
+
+    verify_token_and_error_edges(model, graph)
+    verify_feature_edges(model, graph)
+
+
+def test_small_llama_model():
+    s = torch.tensor([0, 3, 4, 3, 2, 5, 3, 8])
+    verify_small_llama_model(s)
+
+
+def test_large_llama_model():
+    s = torch.tensor([0, 113, 24, 53, 27])
+    verify_large_llama_model(s)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_llama_3_2_1b():
     s = "The National Digital Analytics Group (ND"
-    model = ReplacementModel.from_pretrained("meta-llama/Llama-3.2-1B", "llama")
-    assert isinstance(model, TransformerLensReplacementModel)
-    graph = attribute(s, model, batch_size=128)
-
-    verify_token_and_error_edges(model, graph)
-    verify_feature_edges(model, graph)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_llama_3_2_1b_clt():
-    s = "The National Digital Analytics Group (ND"
-    model = ReplacementModel.from_pretrained(
-        "meta-llama/Llama-3.2-1B", "mntss/clt-llama-3.2-1b-524k"
-    )
-    assert isinstance(model, TransformerLensReplacementModel)
-    graph = attribute(s, model, batch_size=128)
-
-    verify_token_and_error_edges(model, graph)
-    verify_feature_edges(model, graph)
-
-
-if __name__ == "__main__":
-    torch.manual_seed(42)
-    test_small_llama_model()
-    test_large_llama_model()
-    test_llama_3_2_1b()
-    test_llama_3_2_1b_clt()
+    verify_llama_3_2_1b(s)

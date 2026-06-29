@@ -3,13 +3,14 @@ from __future__ import annotations
 import glob
 import logging
 import os
+import re
 from typing import NamedTuple
 from collections.abc import Iterable
 from urllib.parse import parse_qs, urlparse
 
 import torch
 import yaml
-from huggingface_hub import get_token, hf_api, hf_hub_download, snapshot_download
+from huggingface_hub import get_token, hf_api, hf_hub_download, snapshot_download, list_repo_files
 from huggingface_hub.constants import HF_HUB_ENABLE_HF_TRANSFER
 from huggingface_hub.utils.tqdm import tqdm as hf_tqdm
 from tqdm.contrib.concurrent import thread_map
@@ -30,18 +31,9 @@ class HfUri(NamedTuple):
             return parse_hf_uri(hf_ref)
 
         parts = hf_ref.split("@", 1)
-        path_part = parts[0]
+        repo_id = parts[0]
         revision = parts[1] if len(parts) > 1 else None
-
-        path_components = path_part.split("/")
-        if len(path_components) >= 2:
-            repo_id = "/".join(path_components[:2])
-            file_path = "/".join(path_components[2:]) if len(path_components) > 2 else None
-        else:
-            repo_id = path_part
-            file_path = None
-
-        return cls(repo_id, file_path, revision)
+        return cls(repo_id, None, revision)
 
 
 def load_transcoder_from_hub(
@@ -50,45 +42,19 @@ def load_transcoder_from_hub(
     dtype: torch.dtype = torch.float32,
     lazy_encoder: bool = False,
     lazy_decoder: bool = True,
-    cache_dir: str | None = None,
-    use_cache: bool = True,
 ):
-    """Load a transcoder from a HuggingFace URI.
-
-    If the transcoder is cached locally (via save_transcoders_to_cache), it will be
-    loaded from cache instead of downloading from HuggingFace.
-
-    Args:
-        hf_ref: HuggingFace reference (e.g., "mwhanna/gemma-scope-transcoders")
-        device: Device to load the transcoder to
-        dtype: Data type for transcoder weights
-        lazy_encoder: Whether to lazy load encoder weights
-        lazy_decoder: Whether to lazy load decoder weights
-        cache_dir: Override the cache directory for checking/loading cached transcoders
-        use_cache: Whether to check for and use cached transcoders (default: True)
-
-    Returns:
-        Tuple of (transcoder, config)
-    """
-    from circuit_tracer.utils.caching import is_cached, load_transcoders_from_cache
-
-    # Check cache first
-    if use_cache and is_cached(hf_ref, cache_dir):
-        logger.info(f"Loading transcoders from cache for {hf_ref}")
-        return load_transcoders_from_cache(
-            hf_ref,
-            cache_dir=cache_dir,
-            device=device,
-            dtype=dtype,
-            lazy_encoder=lazy_encoder,
-            lazy_decoder=lazy_decoder,
-        )
+    """Load a transcoder from a HuggingFace URI."""
 
     # resolve legacy references
     if hf_ref == "gemma":
-        hf_ref = "mwhanna/gemma-scope-transcoders"
+        hf_ref = "mntss/gemma-scope-transcoders"
     elif hf_ref == "llama":
         hf_ref = "mntss/transcoder-Llama-3.2-1B"
+
+    # Handle Gemma 3 / Gemma Scope 2 auto-config
+    if "gemma-3" in hf_ref.lower() or "gemma-scope-2" in hf_ref.lower():
+        config = generate_gemma_3_config(hf_ref)
+        return load_transcoders(config, device, dtype, lazy_encoder, lazy_decoder), config
 
     hf_uri = HfUri.from_str(hf_ref)
     try:
@@ -96,41 +62,18 @@ def load_transcoder_from_hub(
             repo_id=hf_uri.repo_id,
             revision=hf_uri.revision,
             filename="config.yaml",
-            subfolder=hf_uri.file_path,
         )
     except Exception as e:
-        from circuit_tracer.utils.gemma3_transcoder_config import (
-            build_gemma3_transcoder_config,
-        )
+        # If config.yaml is missing, we might try to infer if it's a simple folder of safetensors
+        # But for now, stick to original logic unless matched above.
+        raise FileNotFoundError(f"Could not download config.yaml from {hf_uri.repo_id}") from e
 
-        generated_config = build_gemma3_transcoder_config(hf_uri)
-        if generated_config is not None:
-            return (
-                load_transcoders(
-                    generated_config,
-                    device,
-                    dtype,
-                    lazy_encoder,
-                    lazy_decoder,
-                ),
-                generated_config,
-            )
-
-        config_file = (
-            f"{hf_uri.file_path}/config.yaml" if hf_uri.file_path is not None else "config.yaml"
-        )
-        raise FileNotFoundError(f"Could not download {config_file} from {hf_uri.repo_id}") from e
-
-    with open(config_path, "r") as f:
+    with open(config_path) as f:
         config = yaml.safe_load(f)
 
     config["repo_id"] = hf_uri.repo_id
     config["revision"] = hf_uri.revision
-    config["subfolder"] = hf_uri.file_path
-    repo_info = (
-        hf_uri.repo_id if hf_uri.file_path is None else hf_uri.repo_id + "//" + hf_uri.file_path
-    )
-    config["scan"] = f"{repo_info}@{hf_uri.revision}" if hf_uri.revision else repo_info
+    config["scan"] = f"{hf_uri.repo_id}@{hf_uri.revision}" if hf_uri.revision else hf_uri.repo_id
 
     return load_transcoders(config, device, dtype, lazy_encoder, lazy_decoder), config
 
@@ -146,65 +89,35 @@ def load_transcoders(
 
     model_kind = config["model_kind"]
     if model_kind == "transcoder_set":
-        from circuit_tracer.transcoder.single_layer_transcoder import (
-            load_transcoder_set,
-        )
+        from circuit_tracer.transcoder.single_layer_transcoder import load_transcoder_set
 
         transcoder_paths = resolve_transcoder_paths(config)
-
-        repo_id = config.get("repo_id", "")
-        # consider checking for google/gemma-scope-2
-        # but this is tricky as repo_id likely points to mwhanna/... rather than google
-        if "gemma-scope-2" in repo_id and "transcoders" in config:
-            special_load_fn = "gemma-scope-2"
-        elif "gemma-scope" in repo_id and "transcoders" in config:
-            special_load_fn = "gemma-scope"
-        else:
-            special_load_fn = None
+        is_gemma_scope = "gemma-scope" in config.get("repo_id", "")
+        is_gemma_3 = config.get("gemma_3", False) or "gemma-3" in config.get("repo_id", "") or "gemma-scope-2" in config.get("repo_id", "")
 
         return load_transcoder_set(
             transcoder_paths,
             scan=config["scan"],
             feature_input_hook=config["feature_input_hook"],
             feature_output_hook=config["feature_output_hook"],
-            special_load_fn=special_load_fn,
+            gemma_scope=is_gemma_scope,
+            gemma_3=is_gemma_3,
             dtype=dtype,
             device=device,
             lazy_encoder=lazy_encoder,
             lazy_decoder=lazy_decoder,
         )
     elif model_kind == "cross_layer_transcoder":
-        from circuit_tracer.transcoder.cross_layer_transcoder import (
-            load_clt,
-            load_gemma_scope_2_clt,
+        from circuit_tracer.transcoder.cross_layer_transcoder import load_clt
+
+        local_path = snapshot_download(
+            config["repo_id"],
+            revision=config.get("revision", "main"),
+            allow_patterns=["*.safetensors"],
         )
 
-        if "gemma-scope-2" in config["repo_id"] and "transcoders" in config:
-            transcoder_paths = resolve_transcoder_paths(config)
-            local_path = transcoder_paths
-
-            load_fn = load_gemma_scope_2_clt
-
-        else:
-            subfolder = config.get("subfolder")
-            if subfolder:
-                allow_patterns = [f"{subfolder}/*.safetensors"]
-            else:
-                allow_patterns = ["*.safetensors"]
-
-            local_path = snapshot_download(
-                config["repo_id"],
-                revision=config.get("revision", "main"),
-                allow_patterns=allow_patterns,
-            )
-
-            if subfolder:
-                local_path = os.path.join(local_path, subfolder)
-
-            load_fn = load_clt
-
-        return load_fn(
-            local_path,  # type:ignore
+        return load_clt(
+            local_path,
             scan=config["scan"],
             feature_input_hook=config["feature_input_hook"],
             feature_output_hook=config["feature_output_hook"],
@@ -217,64 +130,105 @@ def load_transcoders(
         raise ValueError(f"Unknown model kind: {model_kind}")
 
 
-def resolve_transcoder_paths(config: dict) -> dict[int, str]:
+def resolve_transcoder_paths(config: dict) -> dict:
     if "transcoders" in config:
-        hf_paths = [path for path in config["transcoders"] if path.startswith("hf://")]
-        local_map = download_hf_uris(hf_paths)
-        transcoder_paths = {
-            i: local_map.get(path, path) for i, path in enumerate(config["transcoders"])
-        }
-    else:
-        subfolder = config.get("subfolder")
-        if subfolder:
-            allow_patterns = [f"{subfolder}/layer_*.safetensors"]
+        transcoders = config["transcoders"]
+        if isinstance(transcoders, dict):
+            # Dict {layer: path}
+            hf_paths = [path for path in transcoders.values() if path.startswith("hf://")]
+            local_map = download_hf_uris(hf_paths)
+            transcoder_paths = {
+                # Map keys (layers) to local paths
+                # Key k can be int or string "1", "2"
+                int(k): local_map.get(v, v) for k, v in transcoders.items()
+            }
         else:
-            allow_patterns = ["layer_*.safetensors"]
-
+            # List [path0, path1, ...]
+            hf_paths = [path for path in transcoders if path.startswith("hf://")]
+            local_map = download_hf_uris(hf_paths)
+            transcoder_paths = {
+                i: local_map.get(path, path) for i, path in enumerate(transcoders)
+            }
+    else:
         local_path = snapshot_download(
             config["repo_id"],
             revision=config.get("revision", "main"),
-            allow_patterns=allow_patterns,
+            allow_patterns=["layer_*.safetensors"],
         )
-
-        if subfolder:
-            local_path = os.path.join(local_path, subfolder)
-
         layer_files = glob.glob(os.path.join(local_path, "layer_*.safetensors"))
         transcoder_paths = {
             i: os.path.join(local_path, f"layer_{i}.safetensors") for i in range(len(layer_files))
         }
-    return transcoder_paths  # type:ignore
+    return transcoder_paths
 
 
-def iter_transcoder_paths(config: dict) -> Iterable[tuple[int, str]]:
-    """Lazily yield (layer_index, local_path) tuples, downloading one at a time."""
-    if "transcoders" in config:
-        for i, path in enumerate(config["transcoders"]):
-            if path.startswith("hf://"):
-                local_path = download_hf_uri(path)
-            else:
-                local_path = path
-            yield i, local_path
+def generate_gemma_3_config(repo_id: str) -> dict:
+    """Generate a config for Gemma 3 scope by inspecting the repo structure."""
+    
+    files = list_repo_files(repo_id)
+    
+    # Priority defaults
+    # Width: 16k -> 65k -> 262k
+    # Sparsity: l0_medium -> l0_small -> l0_big
+    
+    transcoders = {}
+    
+    # Identify available layers and variants
+    # Pattern: transcoder_all/layer_{layer}_width_{width}_l0_{sparsity}/params.safetensors
+    # Or fallback to mlp_out if transcoder_all is missing (for specific layers)
+    
+    # Check if we have transcoder_all
+    has_transcoder_all = any("transcoder_all" in f for f in files)
+    
+    if has_transcoder_all:
+        pattern = re.compile(r"transcoder_all/layer_(\d+)_width_(\w+)_l0_(\w+)/params.safetensors")
     else:
-        subfolder = config.get("subfolder")
-        if subfolder:
-            allow_patterns = [f"{subfolder}/layer_*.safetensors"]
-        else:
-            allow_patterns = ["layer_*.safetensors"]
-
-        local_path = snapshot_download(
-            config["repo_id"],
-            revision=config.get("revision", "main"),
-            allow_patterns=allow_patterns,
-        )
-
-        if subfolder:
-            local_path = os.path.join(local_path, subfolder)
-
-        layer_files = glob.glob(os.path.join(local_path, "layer_*.safetensors"))
-        for i in range(len(layer_files)):
-            yield i, os.path.join(local_path, f"layer_{i}.safetensors")
+        # Fallback to sparse layers
+        pattern = re.compile(r"mlp_out/layer_(\d+)_width_(\w+)_l0_(\w+)/params.safetensors")
+    
+    layer_variants = {}
+    for f in files:
+        m = pattern.search(f)
+        if m:
+            layer = int(m.group(1))
+            width = m.group(2)
+            sparsity = m.group(3)
+            
+            if layer not in layer_variants:
+                layer_variants[layer] = []
+            layer_variants[layer].append((width, sparsity, f))
+            
+    # Select best variant for each layer
+    for layer, variants in layer_variants.items():
+        # Score variants
+        def score(v):
+            w, s, _ = v
+            # Width score
+            w_score = 0
+            if w == "16k": w_score = 3
+            elif w == "65k": w_score = 2
+            elif w == "262k": w_score = 1
+            
+            # Sparsity score
+            s_score = 0
+            if s == "medium": s_score = 3
+            elif s == "small": s_score = 2
+            elif s == "big": s_score = 1
+            
+            return (w_score, s_score)
+            
+        best_variant = max(variants, key=score)
+        transcoders[layer] = f"hf://{repo_id}/{best_variant[2]}"
+        
+    return {
+        "repo_id": repo_id,
+        "model_kind": "transcoder_set",
+        "transcoders": transcoders,
+        "feature_input_hook": "ln2.hook_normalized",
+        "feature_output_hook": "hook_mlp_out",
+        "scan": repo_id,
+        "gemma_3": True
+    }
 
 
 def parse_hf_uri(uri: str) -> HfUri:

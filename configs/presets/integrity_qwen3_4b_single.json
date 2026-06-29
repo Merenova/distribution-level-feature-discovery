@@ -1,0 +1,13 @@
+{
+  "extends": ["ambigqa_qwen3_4b.json"],
+  "experiment_name": "integrity_qwen3_4b_single",
+  "stage_1_data_prep": {"n_groups": 1},
+  "sampling": {"max_total_continuations": 64, "batch_size": 16, "max_batches": 32},
+  "attribution": {"batch_size": 64, "max_feature_nodes": 4096},
+  "embedding": {"batch_size": 16},
+  "clustering": {"sweeps": {"beta_values": [0.75], "gamma_values": [0.5], "n_workers": 1}},
+  "stage_7c_steering": {
+    "max_batch_size": 256,
+    "sweeps": [{"name": "integrity_sign", "steering_method": "sign", "h_c_selections": ["full"], "top_B": [5], "epsilon_values": [-1.0, -0.1, 0.0, 0.1, 1.0]}]
+  }
+}

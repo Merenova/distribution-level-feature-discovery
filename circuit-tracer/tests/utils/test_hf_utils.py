@@ -1,11 +1,7 @@
 # file: circuit-tracer/utils/test_hf_utils.py
 
-import gc
 import unittest
 from unittest import mock
-
-import pytest
-import torch
 
 from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
 
@@ -14,13 +10,6 @@ from circuit_tracer.utils.hf_utils import download_hf_uris
 
 # A dummy URI for all tests
 TEST_URI = "hf://test-org/test-repo/model.bin"
-
-
-@pytest.fixture(autouse=True)
-def cleanup_cuda():
-    yield
-    torch.cuda.empty_cache()
-    gc.collect()
 
 
 class TestHfUtilsDownload(unittest.TestCase):
@@ -106,7 +95,3 @@ class TestHfUtilsDownload(unittest.TestCase):
 
         # download is not called, as the repo is not found
         mock_download.assert_not_called()
-
-
-if __name__ == "__main__":
-    unittest.main()

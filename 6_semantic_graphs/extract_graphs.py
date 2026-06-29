@@ -29,18 +29,15 @@ CIRCUIT_TRACER_PATH = Path(__file__).resolve().parents[1] / "circuit-tracer"
 sys.path.insert(0, str(CIRCUIT_TRACER_PATH))
 
 from utils.config import PathConfig
-from utils.attribution_pooling import load_pooled_attributions
-from utils.data_utils import load_json, save_json, save_torch, reconstruct_active_features
+from utils.data_utils import load_json, save_torch, reconstruct_active_features
 from utils.logging_utils import setup_logger, get_log_path
-from utils.manifest import filter_samples_by_manifest, update_manifest_with_results
 
 
 def extract_semantic_graphs(
     clustering_result: dict,
     branches_data: dict,
     attribution_graph_path: Path,
-    logger,
-    pooling: str = "mean",
+    logger
 ) -> dict:
     """Extract semantic graphs and related quantities from clustering result.
 
@@ -49,7 +46,6 @@ def extract_semantic_graphs(
         branches_data: Branch samples data with continuations
         attribution_graph_path: Path to attribution graph .pt file
         logger: Logger instance
-        pooling: Attribution pooling mode used by Stage 5 clustering
 
     Returns:
         Dictionary with semantic graphs, soft node memberships, token attributions, etc.
@@ -98,19 +94,13 @@ def extract_semantic_graphs(
     n_token = data["n_prefix_tokens"]
     n_attribution_nodes = data["n_prefix_sources"]
 
-    pooled_attributions = load_pooled_attributions(
-        attribution_graph_path,
-        pooling=pooling,
-    )
-    attributions_a = pooled_attributions.values
-    logger.info(
-        "Loaded attribution embeddings from prefix context: shape %s, source=%s, "
-        "requested_pooling=%s, effective_pooling=%s",
-        attributions_a.shape,
-        pooled_attributions.source,
-        pooled_attributions.requested_pooling,
-        pooled_attributions.effective_pooling,
-    )
+    # Extract attributions
+    # aggregated_attributions: (n_continuations, n_prefix_sources)
+    attributions_a = data["aggregated_attributions"]
+    if isinstance(attributions_a, torch.Tensor):
+        attributions_a = attributions_a.float().cpu().numpy()
+
+    logger.info(f"Loaded aggregated attributions from prefix context: {attributions_a.shape}")
 
     # Verify shape matches n_samples (continuations)
     if attributions_a.shape[0] != n_samples:
@@ -191,27 +181,12 @@ def extract_semantic_graphs(
         soft_node_memberships = np.array([])
 
     # Token-level summaries are disabled when token grouping is removed
-    token_scores = {}
-    token_attributions = {}
-    token_attributions_reconstructed = {}
-    attribution_reconstruction_errors = {}
-
     return {
-        # Hierarchical decomposition (shared components)
-        "H_0": H_0,  # Global mean (shared attribution)
-        # Delta_H_c directly
+        "H_0": H_0,
         "semantic_graphs": semantic_graphs,
-        # Same as semantic_graphs
         "semantic_graphs_centered": semantic_graphs_centered,
-        # Other fields
         "soft_node_memberships": soft_node_memberships,
-        "token_attributions": token_attributions,
-        "token_attributions_reconstructed": token_attributions_reconstructed,
-        "attribution_reconstruction_errors": attribution_reconstruction_errors,
-        "token_scores": token_scores,
         "component_ids": component_ids,
-        # Feature index mapping: active_features[i] = [layer, pos, feat_id]
-        # Allows interpreting H_c[i] as a specific model feature
         "active_features": active_features,
         "n_features": n_features,
         "n_error_nodes": n_error,
@@ -237,7 +212,7 @@ def main():
         "--attribution-graphs-dir",
         type=Path,
         required=True,
-        help="Directory with attribution graphs (Stage 2)"
+        help="Directory with attribution graphs (Stage 3)"
     )
     parser.add_argument(
         "--output-dir",
@@ -250,12 +225,6 @@ def main():
         type=Path,
         default=None,
         help="Directory for log files"
-    )
-    parser.add_argument(
-        "--pooling",
-        choices=["mean", "sum", "max"],
-        default="mean",
-        help="Attribution pooling mode used by Stage 5 clustering",
     )
     parser.add_argument(
         "--quiet",
@@ -285,24 +254,12 @@ def main():
     logger.info(f"Samples dir: {args.samples_dir}")
     logger.info(f"Attribution graphs dir: {args.attribution_graphs_dir}")
     logger.info(f"Output dir: {args.output_dir}")
-    logger.info(f"Attribution pooling: {args.pooling}")
 
     # Find all clustering sweep result files
     clustering_files = sorted(args.clustering_dir.glob("*_sweep_results.json"))
     logger.info(f"\nFound {len(clustering_files)} sweep results")
 
-    # Filter based on Stage 5 manifest
-    # Derive results_dir from clustering_dir to respect --output-dir
-    # clustering_dir is typically {output_dir}/results/5_clustering/
-    results_dir = args.clustering_dir.parent
-    all_prefix_ids = [f.stem.replace("_sweep_results", "") for f in clustering_files]
-    available_ids, skipped_ids = filter_samples_by_manifest(
-        all_prefix_ids, results_dir, "stage5", logger
-    )
-    # Filter clustering files to only available ones
-    available_id_set = set(available_ids)
-    clustering_files = [f for f in clustering_files if f.stem.replace("_sweep_results", "") in available_id_set]
-    logger.info(f"Processing {len(clustering_files)} available results (skipped {len(skipped_ids)})")
+    logger.info(f"Processing {len(clustering_files)} sweep result files")
 
     # Process each file
     completed_ids = []
@@ -336,10 +293,7 @@ def main():
                 continue
             branches_data = load_json(branches_file)
 
-            # Load attribution graph. The prefix-context format is the only
-            # supported format for pooled continuation attribution.
             attribution_graph_file = args.attribution_graphs_dir / f"{prefix_id}_prefix_context.pt"
-
             if not attribution_graph_file.exists():
                 logger.warning(f"Missing attribution graph for {prefix_id}, skipping")
                 failed_ids.append(prefix_id)
@@ -347,30 +301,22 @@ def main():
                 continue
 
             grid_results = clustering_sweep.get("grid", [])
-
-            # Get K_max from sweep config (default 20)
             sweep_config = clustering_sweep.get("sweep_config", {})
-            K_max = sweep_config.get("K_max", 20)
+            K_clamp = int(sweep_config.get("K_clamp", sweep_config.get("K_max", 20)))
 
-            # Filter: valid entries with intermediate K (not 1 and not K_max)
             valid_grid = []
-            skipped_boundary = []
             for entry in grid_results:
                 if not entry.get("components") or not entry.get("assignments") or "error" in entry:
                     continue
                 K = entry.get("K", len(entry.get("components", {})))
-                if K == 1 or K == K_max:
-                    skipped_boundary.append((entry.get("beta"), entry.get("gamma"), K))
+                if K <= 1 or K > K_clamp:
                     continue
                 valid_grid.append(entry)
 
-            if skipped_boundary:
-                logger.info(f"  Skipped {len(skipped_boundary)} configs with K=1 or K={K_max}: {skipped_boundary[:5]}{'...' if len(skipped_boundary) > 5 else ''}")
-
             if not valid_grid:
-                logger.warning(f"  No valid clustering results for {prefix_id} (all K=1 or K={K_max})")
+                logger.warning(f"  No valid clustering results for {prefix_id}")
                 failed_ids.append(prefix_id)
-                errors[prefix_id] = f"No valid clustering results (all K=1 or K={K_max})"
+                errors[prefix_id] = "No valid clustering results"
                 continue
 
             processed_any = False
@@ -389,82 +335,15 @@ def main():
                     clustering_result,
                     branches_data,
                     attribution_graph_file,
-                    logger,
-                    pooling=args.pooling,
+                    logger
                 )
 
                 logger.info(f"  Components ({clustering_key}): {len(graphs_data['component_ids'])}")
-                logger.info(f"  Unique tokens ({clustering_key}): {len(graphs_data['token_scores'])}")
 
                 # Save graphs (as PyTorch .pt file, consistent with knowledge_attribution)
                 output_file_pt = args.output_dir / f"{prefix_id}_{clustering_key}_semantic_graphs.pt"
                 save_torch(graphs_data, output_file_pt)
                 logger.info(f"  Saved to: {output_file_pt}")
-
-                # Also save JSON summary
-                output_file_json = args.output_dir / f"{prefix_id}_{clustering_key}_semantic_graphs.json"
-                # Compute soft membership stats if available
-                soft_membership_stats = {}
-                if graphs_data["soft_node_memberships"] is not None and len(graphs_data["soft_node_memberships"]) > 0:
-                    sigma = graphs_data["soft_node_memberships"]
-                    soft_membership_stats = {
-                        "shape": list(sigma.shape),
-                        "max_membership_per_node": {
-                            "mean": float(np.max(sigma, axis=0).mean()),
-                            "min": float(np.max(sigma, axis=0).min()),
-                            "max": float(np.max(sigma, axis=0).max()),
-                        },
-                    }
-
-                # Feature mapping info for JSON summary
-                feature_mapping_info = {
-                    "n_features": graphs_data["n_features"],
-                    "n_error_nodes": graphs_data["n_error_nodes"],
-                    "n_token_nodes": graphs_data["n_token_nodes"],
-                    "has_active_features": graphs_data["active_features"] is not None,
-                }
-                if graphs_data["active_features"] is not None:
-                    feature_mapping_info["active_features_shape"] = list(graphs_data["active_features"].shape)
-
-                # Prepare H_0 for JSON
-                H_0_json = None
-                if graphs_data["H_0"] is not None:
-                    H_0_json = {
-                        "norm": float(np.linalg.norm(graphs_data["H_0"])),
-                        "shape": list(graphs_data["H_0"].shape),
-                    }
-
-                graphs_data_json = {
-                    "prefix_id": prefix_id,
-                    "prefix": clustering_sweep.get("prefix", ""),
-                    "clustering_key": clustering_key,
-                    "beta": beta,
-                    "gamma": gamma,
-                    "n_components": len(graphs_data["component_ids"]),
-                    "component_ids": graphs_data["component_ids"],
-                    "n_tokens": len(graphs_data["token_scores"]),
-                    # Hierarchical decomposition
-                    "H_0": H_0_json,
-                    "semantic_graphs_shape": {
-                        str(c): list(H.shape) for c, H in graphs_data["semantic_graphs"].items()
-                    },
-                    "feature_mapping": feature_mapping_info,
-                    "soft_node_memberships": soft_membership_stats,
-                    "token_scores": {
-                        str(token): {str(c): float(score) for c, score in scores.items()}
-                        for token, scores in graphs_data["token_scores"].items()
-                    },
-                    "attribution_reconstruction_errors": {
-                        str(token): float(error)
-                        for token, error in graphs_data["attribution_reconstruction_errors"].items()
-                    },
-                    "reconstruction_error_stats": {
-                        "mean": float(np.mean(list(graphs_data["attribution_reconstruction_errors"].values()))),
-                        "max": float(np.max(list(graphs_data["attribution_reconstruction_errors"].values()))),
-                        "min": float(np.min(list(graphs_data["attribution_reconstruction_errors"].values()))),
-                    } if len(graphs_data["attribution_reconstruction_errors"]) > 0 else {},
-                }
-                save_json(graphs_data_json, output_file_json)
                 processed_any = True
 
             if processed_any:
@@ -478,22 +357,11 @@ def main():
             failed_ids.append(prefix_id)
             errors[prefix_id] = error_msg
 
-    # Write Stage 6 manifest
-    update_manifest_with_results(
-        results_dir=results_dir,
-        stage_name="stage6",
-        processed=completed_ids,
-        failed=failed_ids,
-        skipped=skipped_ids,
-        logger=logger,
-        errors=errors,
-    )
-
     logger.info("\n" + "=" * 60)
     logger.info("COMPLETE")
     logger.info("=" * 60)
     logger.info(f"Processed {len(completed_ids)} results")
-    logger.info(f"Completed: {len(completed_ids)}, Failed: {len(failed_ids)}, Skipped: {len(skipped_ids)}")
+    logger.info(f"Completed: {len(completed_ids)}, Failed: {len(failed_ids)}")
     logger.info(f"Output directory: {args.output_dir}")
 
 

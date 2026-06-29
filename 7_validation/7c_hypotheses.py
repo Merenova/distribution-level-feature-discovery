@@ -15,11 +15,12 @@ import json
 import argparse
 import logging
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 from itertools import product
 
 import numpy as np
 import torch
+from scipy.stats import linregress, spearmanr
 from tqdm import tqdm
 
 # Add parent directory to path
@@ -30,7 +31,6 @@ sys.path.insert(0, str(CIRCUIT_TRACER_PATH))
 from utils.data_utils import load_json, save_json
 from utils.logging_utils import setup_logger, get_log_path
 from utils.memory_utils import maybe_clear_memory, reset_cuda_state
-from utils.model_backend import resolve_backend, resolve_stage_backend
 from circuit_tracer import ReplacementModel
 
 # Import from refactored modules (use importlib since module names start with digits)
@@ -48,6 +48,40 @@ graph = _import_module("7c_graph", _module_dir / "7c_graph.py")
 steering = _import_module("7c_steering", _module_dir / "7c_steering.py")
 metrics = _import_module("7c_metrics", _module_dir / "7c_metrics.py")
 utils = _import_module("7c_utils", _module_dir / "7c_utils.py")
+
+
+# =============================================================================
+# Sweep Config Parsing
+# =============================================================================
+
+def load_sweep_config(config_path: Path) -> Dict[str, Any]:
+    """Load and validate sweep config from JSON file."""
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    if "sweeps" not in config:
+        config["sweeps"] = []
+
+    config.setdefault("sampling", {})
+    config["sampling"].setdefault("max_samples_per_cluster", 30)
+    config["sampling"].setdefault("max_prefixes", None)
+
+    config.setdefault("validation", {})
+    config["validation"].setdefault("freeze_attention", False)
+    config["validation"].setdefault("log_details", False)
+
+    # Validate and normalize each sweep using shared utility
+    defaults = {
+        "h_c_selections": ["full"],
+        "top_B": [10],
+        "epsilon_values": [-1.0, 0.0, 1.0]
+    }
+    config["sweeps"] = [
+        utils.validate_and_normalize_sweep_config(sweep, defaults)
+        for sweep in config["sweeps"]
+    ]
+
+    return config
 
 
 def parse_sweeps_from_main_config(stage_7c_config: Dict[str, Any]) -> Dict[str, Any]:
@@ -127,13 +161,38 @@ def _save_hypothesis_outputs(prefix_results: Dict[str, Any], hypotheses: List[st
         hypothesis_dir = output_dir / folder_name
         hypothesis_dir.mkdir(parents=True, exist_ok=True)
 
-        per_prefix = {
-            "prefix_id": prefix_id,
-            "feature_selection": prefix_results.get("feature_selection"),
-            "clustering_runs": {}
-        }
+        if hypothesis == "H4A":
+            per_prefix = _compact_h4a_prefix_results(prefix_results)
+        else:
+            per_prefix = {
+                "prefix_id": prefix_id,
+                "feature_selection": prefix_results.get("feature_selection"),
+                "clustering_runs": {}
+            }
 
         for clustering_key, run in clustering_runs.items():
+            if hypothesis == "H4A":
+                entry = {
+                    "beta": run.get("beta"),
+                    "gamma": run.get("gamma"),
+                    "K": run.get("K"),
+                    "n_clusters": run.get("n_clusters"),
+                    "n_branches": run.get("n_branches"),
+                    "results": {},
+                }
+                if run.get("selected_indices"):
+                    entry["selected_indices"] = {
+                        str(cluster_id): int(sample_idx)
+                        for cluster_id, sample_idx in run["selected_indices"].items()
+                    }
+
+                for sweep_key, result in run.get("results", {}).items():
+                    entry["results"][sweep_key] = _compact_h4a_result(result)
+
+                if entry["results"]:
+                    per_prefix["clustering_runs"][clustering_key] = entry
+                continue
+
             entry = {
                 "beta": run.get("beta"),
                 "gamma": run.get("gamma"),
@@ -164,77 +223,98 @@ def _save_hypothesis_outputs(prefix_results: Dict[str, Any], hypotheses: List[st
             save_json(per_prefix, hypothesis_dir / f"{prefix_id}_sweep_results.json")
 
 
-def _float_list(values: List[float]) -> List[float]:
-    return [float(v) for v in values]
+def _paper_method_name(prefix_results: Dict[str, Any]) -> str:
+    raw = prefix_results.get("method") or prefix_results.get("baseline_method") or "rd"
+    method_map = {
+        "combined_medoid": "rd",
+        "rd": "rd",
+        "kmeans": "km_sem",
+        "kmeans_medoid": "km_sem",
+        "km_sem": "km_sem",
+        "single_continuation": "single",
+        "single": "single",
+    }
+    return method_map.get(str(raw), str(raw))
 
 
-def _diff_lists(steered: List[float], original: List[float]) -> List[float]:
-    return [round(float(s) - float(o), 12) for s, o in zip(steered, original)]
+def _curve_value(curve: Dict[Any, Any], epsilon: Any) -> Optional[float]:
+    if not isinstance(curve, dict):
+        return None
+
+    candidates = [epsilon]
+    try:
+        epsilon_float = float(epsilon)
+        candidates.extend([epsilon_float, str(epsilon_float), str(epsilon)])
+    except (TypeError, ValueError):
+        candidates.append(str(epsilon))
+
+    for key in candidates:
+        if key in curve:
+            value = curve[key]
+            return float(value) if value is not None else None
+    return None
 
 
-def _scalar_delta(steered: float, original: float) -> float:
-    return round(float(steered) - float(original), 12)
+def _compact_h4a_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    if "error" in result:
+        return {"error": result["error"]}
 
-
-def _sequence_values_from_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "raw_target_logits": _float_list(meta.get("per_token_target_logits_original", [])),
-        "target_probs": _float_list(meta.get("per_token_target_probs_original", [])),
-        "demeaned_logits": _float_list(meta.get("per_token_centered_logits_original", [])),
-        "mean_raw_target_logit": float(meta.get("mean_target_logit_original", 0.0)),
-        "mean_target_prob": float(meta.get("mean_target_prob_original", 0.0)),
-        "mean_demeaned_logit": float(meta.get("mean_centered_logit_original", 0.0)),
+    compact = {
+        "steering_method": result.get("steering_method"),
+        "hc_selection": result.get("hc_selection"),
+        "top_B": result.get("top_B"),
+        "epsilon_values": result.get("epsilon_values", []),
+        "per_cluster": {},
     }
 
+    keep_cluster_keys = [
+        "centered_logit_diff",
+        "centered_logit_corr",
+        "centered_logit_spearman",
+        "sum_centered_logit_diff",
+        "n_samples",
+    ]
 
-def _build_per_sequence_logit_record(
-    branch_id: int,
-    continuation_token_ids: List[int],
-    original_values: Dict[str, Any],
-    steered_values: Dict[str, Any],
-    log_prob_original: float,
-    log_prob_steered: float,
-) -> Dict[str, Any]:
-    """Build an inspectable JSON record for one steered continuation."""
-    raw_original = _float_list(original_values.get("raw_target_logits", []))
-    raw_steered = _float_list(steered_values.get("raw_target_logits", []))
-    prob_original = _float_list(original_values.get("target_probs", []))
-    prob_steered = _float_list(steered_values.get("target_probs", []))
-    demeaned_original = _float_list(original_values.get("demeaned_logits", []))
-    demeaned_steered = _float_list(steered_values.get("demeaned_logits", []))
+    for cluster_id, stats in result.get("per_cluster_logit", {}).items():
+        compact["per_cluster"][str(cluster_id)] = {
+            key: stats[key]
+            for key in keep_cluster_keys
+            if key in stats
+        }
 
-    mean_raw_original = float(original_values.get("mean_raw_target_logit", 0.0))
-    mean_raw_steered = float(steered_values.get("mean_raw_target_logit", 0.0))
-    mean_prob_original = float(original_values.get("mean_target_prob", 0.0))
-    mean_prob_steered = float(steered_values.get("mean_target_prob", 0.0))
-    mean_demeaned_original = float(original_values.get("mean_demeaned_logit", 0.0))
-    mean_demeaned_steered = float(steered_values.get("mean_demeaned_logit", 0.0))
-
-    return {
-        "branch_id": int(branch_id),
-        "continuation_token_ids": [int(t) for t in continuation_token_ids],
-        "raw_target_logits_original": raw_original,
-        "raw_target_logits_steered": raw_steered,
-        "raw_target_logit_delta": _diff_lists(raw_steered, raw_original),
-        "target_probs_original": prob_original,
-        "target_probs_steered": prob_steered,
-        "target_prob_delta": _diff_lists(prob_steered, prob_original),
-        "demeaned_logits_original": demeaned_original,
-        "demeaned_logits_steered": demeaned_steered,
-        "demeaned_logit_delta": _diff_lists(demeaned_steered, demeaned_original),
-        "mean_raw_target_logit_original": mean_raw_original,
-        "mean_raw_target_logit_steered": mean_raw_steered,
-        "mean_raw_target_logit_delta": _scalar_delta(mean_raw_steered, mean_raw_original),
-        "mean_target_prob_original": mean_prob_original,
-        "mean_target_prob_steered": mean_prob_steered,
-        "mean_target_prob_delta": _scalar_delta(mean_prob_steered, mean_prob_original),
-        "mean_demeaned_logit_original": mean_demeaned_original,
-        "mean_demeaned_logit_steered": mean_demeaned_steered,
-        "mean_demeaned_logit_delta": _scalar_delta(mean_demeaned_steered, mean_demeaned_original),
-        "log_prob_original": float(log_prob_original),
-        "log_prob_steered": float(log_prob_steered),
-        "log_prob_delta": _scalar_delta(log_prob_steered, log_prob_original),
+    metric_map = {
+        "centered_logit_corr_mean": result.get("mean_logit_corr"),
+        "centered_logit_spearman_mean": result.get("mean_logit_spearman"),
     }
+    for key, value in metric_map.items():
+        if value is not None:
+            compact[key] = float(value)
+
+    for epsilon in compact["epsilon_values"]:
+        total = 0.0
+        saw_value = False
+        for stats in compact["per_cluster"].values():
+            value = _curve_value(stats.get("sum_centered_logit_diff", {}), epsilon)
+            if value is None:
+                continue
+            total += value
+            saw_value = True
+        if saw_value:
+            compact[f"sum_diff_eps{epsilon}"] = total
+
+    return compact
+
+
+def _compact_h4a_prefix_results(prefix_results: Dict[str, Any]) -> Dict[str, Any]:
+    compact = {
+        "prefix_id": prefix_results.get("prefix_id"),
+        "method": _paper_method_name(prefix_results),
+        "feature_selection": prefix_results.get("feature_selection"),
+        "clustering_runs": {},
+    }
+    if "random_seed" in prefix_results:
+        compact["random_seed"] = prefix_results["random_seed"]
+    return compact
 
 
 def _prefix_outputs_exist(prefix_id: str, hypotheses: List[str], output_dir: Path, hypothesis_dirs: Dict[str, str]) -> bool:
@@ -596,6 +676,93 @@ def _run_steering_evaluation(
             maybe_clear_memory(gc_collect=False, cuda_empty_cache=False, min_interval_s=120.0, logger=logger, tag="h4a_chunk")
 
     return results
+
+
+# =============================================================================
+# Hypothesis Validation Functions
+# =============================================================================
+
+def validate_h4a_dose_response(
+    model,
+    branches: List[Dict],
+    features_by_cluster: Dict[int, List[Tuple]],
+    cluster_decoder_cache: Dict,
+    cluster_encoder_cache: Dict,
+    baseline_metadata: Dict[int, Dict],
+    epsilon_values: List[float],
+    steering_method: str,
+    cross_prefix_batching: bool = False,
+    max_cluster_samples: int = 20,
+    batch_size: int = 16,
+    max_seq_len: int = None,
+    logger=None
+) -> Dict[str, Any]:
+    """H4a: Validate dose-response relationship.
+
+    For each cluster, steer with H_c at different epsilon values and measure
+    the relationship between epsilon and probability change.
+    """
+    if logger:
+        logger.info("  Running H4a: dose-response validation...")
+
+    cluster_ids = sorted(features_by_cluster.keys())
+    per_component = {}
+
+    # Group branches by cluster
+    branches_by_cluster = {c: [] for c in cluster_ids}
+    for branch in branches:
+        c = branch["cluster_id"]
+        if c in cluster_ids and branch["branch_id"] in baseline_metadata:
+            branches_by_cluster[c].append(branch)
+
+    # Subsample if needed
+    rng = np.random.RandomState(42)
+    for c in cluster_ids:
+        if max_cluster_samples > 0 and len(branches_by_cluster[c]) > max_cluster_samples:
+            indices = rng.choice(len(branches_by_cluster[c]), size=max_cluster_samples, replace=False)
+            branches_by_cluster[c] = [branches_by_cluster[c][i] for i in indices]
+
+    for comp_id in tqdm(cluster_ids, desc="    H4a Clusters", leave=False):
+        features = features_by_cluster[comp_id]
+        enc_cache = cluster_encoder_cache.get(comp_id, {})
+        dec_cache = cluster_decoder_cache.get(comp_id, {})
+        cluster_branches = branches_by_cluster[comp_id]
+
+        if not cluster_branches:
+            continue
+
+        delta_probs_by_eps = {eps: [] for eps in epsilon_values}
+
+        for epsilon in epsilon_values:
+            eval_results = _run_steering_evaluation(
+                model, cluster_branches, features, enc_cache, dec_cache,
+                baseline_metadata, epsilon, steering_method,
+                cross_prefix_batching=cross_prefix_batching,
+                batch_size=batch_size,
+                max_seq_len=max_seq_len
+            )
+
+            for branch_id, res in eval_results.items():
+                delta_probs_by_eps[epsilon].append(res["rel_change"])
+
+        # Aggregate
+        comp_stats = {"mean_delta_prob": {}, "std_delta_prob": {}}
+        for eps, deltas in delta_probs_by_eps.items():
+            if deltas:
+                comp_stats["mean_delta_prob"][eps] = float(np.mean(deltas))
+                comp_stats["std_delta_prob"][eps] = float(np.std(deltas))
+            else:
+                comp_stats["mean_delta_prob"][eps] = 0.0
+                comp_stats["std_delta_prob"][eps] = 0.0
+
+        if len(epsilon_values) > 2:
+            means = [comp_stats["mean_delta_prob"][e] for e in epsilon_values]
+            slope, intercept, r_value, _, _ = linregress(epsilon_values, means)
+            comp_stats["dose_response_r2"] = float(r_value**2)
+
+        per_component[comp_id] = comp_stats
+
+    return {"per_component": per_component}
 
 
 # H4b removed - no longer needed
@@ -1042,7 +1209,6 @@ def run_steering_sweep(
     max_batch_size: int = 128,
     cross_prefix_batching: bool = False,
     max_seq_len: int = None,
-    store_sequence_logit_values: bool = False,
     logger = None,
 ) -> Dict[str, Any]:
     """Run steering sweep for a single configuration."""
@@ -1075,20 +1241,22 @@ def run_steering_sweep(
             )
 
     # Initialize tracking
+    dose_response = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
+    log_deltas = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
+    log_probs_steered = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
+    log_probs_original = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
     centered_logits_steered = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
     centered_logits_original = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
-    per_sequence_logit_values = (
-        {c: {eps: [] for eps in epsilons} for c in cluster_ids}
-        if store_sequence_logit_values else None
-    )
+    target_logits_steered = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
+    target_logits_original = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
+    target_probs_steered = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
+    target_probs_original = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
     detailed_logs = [] if log_details else None
 
     effective_batch_size = max_batch_size if max_batch_size > 0 else 128
     if logger:
         logger.info(f"  Running steering sweep with batch_size={effective_batch_size}, cross_prefix_batching={cross_prefix_batching}")
         logger.info(f"  Epsilons ({len(epsilons)}): {epsilons}")
-        if store_sequence_logit_values:
-            logger.info("  Storing per-sequence raw/demeaned logit values")
 
     if cross_prefix_batching:
         # Build all items for heterogeneous steering
@@ -1120,7 +1288,6 @@ def run_steering_sweep(
                     "baseline_mean_centered_logit": meta.get("mean_centered_logit_original", 0.0),
                     "baseline_mean_target_logit": meta.get("mean_target_logit_original", 0.0),
                     "baseline_mean_target_prob": meta.get("mean_target_prob_original", 0.0),
-                    "baseline_sequence_values": _sequence_values_from_metadata(meta),
                     "features": features,
                     "decoder_cache": c_decoder_cache,
                 })
@@ -1151,33 +1318,32 @@ def run_steering_sweep(
                 chunk_centered_logits = steering.compute_per_token_centered_logits_batched(
                     logits, chunk_cont_info, return_per_token=log_details
                 )
-                chunk_sequence_values = (
-                    metrics.compute_per_token_logit_values_batched(logits, chunk_cont_info)
-                    if store_sequence_logit_values else None
-                )
+                # Compute mean target logits/probs for steered pass
+                chunk_target_logits_probs = metrics.compute_mean_target_logit_and_prob_batched(logits, chunk_cont_info)
 
                 for idx, (item, log_P) in enumerate(zip(chunk_items, chunk_log_probs)):
                     delta = log_P - item["baseline"]
                     delta = max(min(delta, utils.CLIP_MAX), utils.CLIP_MIN)
                     c_id = item["cluster_id"]
+                    log_deltas[c_id][eps].append(delta)
                     rel_change = np.exp(delta) - 1.0
+                    dose_response[c_id][eps].append(rel_change)
+
+                    # Track log probabilities for cluster mass metrics
+                    log_probs_steered[c_id][eps].append(log_P)
+                    log_probs_original[c_id][eps].append(item["baseline"])
 
                     # Track centered logits
                     _, mean_centered_logit_steered = chunk_centered_logits[idx]
                     centered_logits_steered[c_id][eps].append(mean_centered_logit_steered)
                     centered_logits_original[c_id][eps].append(item["baseline_mean_centered_logit"])
 
-                    if store_sequence_logit_values:
-                        per_sequence_logit_values[c_id][eps].append(
-                            _build_per_sequence_logit_record(
-                                branch_id=item["branch_id"],
-                                continuation_token_ids=item["cont_ids"],
-                                original_values=item["baseline_sequence_values"],
-                                steered_values=chunk_sequence_values[idx],
-                                log_prob_original=item["baseline"],
-                                log_prob_steered=log_P,
-                            )
-                        )
+                    # Track mean target logits/probs
+                    mean_target_logit_steered, mean_target_prob_steered = chunk_target_logits_probs[idx]
+                    target_logits_steered[c_id][eps].append(mean_target_logit_steered)
+                    target_logits_original[c_id][eps].append(item.get("baseline_mean_target_logit", 0.0))
+                    target_probs_steered[c_id][eps].append(mean_target_prob_steered)
+                    target_probs_original[c_id][eps].append(item.get("baseline_mean_target_prob", 0.0))
 
                     if log_details:
                         per_token_centered, _ = chunk_centered_logits[idx]
@@ -1196,9 +1362,7 @@ def run_steering_sweep(
                         })
 
                 # Clear memory after each batch chunk
-                del logits, chunk_log_probs, chunk_centered_logits
-                if chunk_sequence_values is not None:
-                    del chunk_sequence_values
+                del logits, chunk_log_probs, chunk_centered_logits, chunk_target_logits_probs
                 maybe_clear_memory(gc_collect=False, cuda_empty_cache=False, min_interval_s=120.0, logger=logger, tag="sweep_chunk")
     else:
         # Normal batching path
@@ -1254,10 +1418,8 @@ def run_steering_sweep(
                 chunk_centered_logits_base = steering.compute_per_token_centered_logits_batched(
                     logits_base, chunk_cont_info, return_per_token=log_details
                 )
-                chunk_sequence_values_base = (
-                    metrics.compute_per_token_logit_values_batched(logits_base, chunk_cont_info)
-                    if store_sequence_logit_values else None
-                )
+                # Compute mean target logits/probs for baseline
+                chunk_target_logits_probs_base = metrics.compute_mean_target_logit_and_prob_batched(logits_base, chunk_cont_info)
 
                 for eps_idx, eps in enumerate(epsilons, start=1):
                     if logger:
@@ -1271,10 +1433,8 @@ def run_steering_sweep(
                     chunk_centered_logits = steering.compute_per_token_centered_logits_batched(
                         logits, chunk_cont_info, return_per_token=log_details
                     )
-                    chunk_sequence_values = (
-                        metrics.compute_per_token_logit_values_batched(logits, chunk_cont_info)
-                        if store_sequence_logit_values else None
-                    )
+                    # Compute mean target logits/probs for steered pass
+                    chunk_target_logits_probs = metrics.compute_mean_target_logit_and_prob_batched(logits, chunk_cont_info)
 
                     for local_idx, (branch, cont_ids, cont_start, _, meta) in enumerate(chunk_meta_info):
                         log_P = chunk_log_probs[local_idx]
@@ -1283,7 +1443,13 @@ def run_steering_sweep(
                         delta = log_P - log_P_original
                         delta = max(min(delta, utils.CLIP_MAX), utils.CLIP_MIN)
 
+                        log_deltas[steer_c][eps].append(delta)
                         rel_change = np.exp(delta) - 1.0
+                        dose_response[steer_c][eps].append(rel_change)
+
+                        # Track log probabilities for cluster mass metrics
+                        log_probs_steered[steer_c][eps].append(log_P)
+                        log_probs_original[steer_c][eps].append(log_P_original)
 
                         # Track centered logits
                         _, mean_centered_logit_steered = chunk_centered_logits[local_idx]
@@ -1291,17 +1457,13 @@ def run_steering_sweep(
                         centered_logits_steered[steer_c][eps].append(mean_centered_logit_steered)
                         centered_logits_original[steer_c][eps].append(mean_centered_logit_original)
 
-                        if store_sequence_logit_values:
-                            per_sequence_logit_values[steer_c][eps].append(
-                                _build_per_sequence_logit_record(
-                                    branch_id=branch["branch_id"],
-                                    continuation_token_ids=cont_ids,
-                                    original_values=chunk_sequence_values_base[local_idx],
-                                    steered_values=chunk_sequence_values[local_idx],
-                                    log_prob_original=log_P_original,
-                                    log_prob_steered=log_P,
-                                )
-                            )
+                        # Track mean target logits/probs
+                        mean_target_logit_steered, mean_target_prob_steered = chunk_target_logits_probs[local_idx]
+                        mean_target_logit_original, mean_target_prob_original = chunk_target_logits_probs_base[local_idx]
+                        target_logits_steered[steer_c][eps].append(mean_target_logit_steered)
+                        target_logits_original[steer_c][eps].append(mean_target_logit_original)
+                        target_probs_steered[steer_c][eps].append(mean_target_prob_steered)
+                        target_probs_original[steer_c][eps].append(mean_target_prob_original)
 
                         if log_details:
                             per_token_centered_steered, _ = chunk_centered_logits[local_idx]
@@ -1322,25 +1484,27 @@ def run_steering_sweep(
                             })
 
                     # Clear memory after each epsilon value
-                    del logits, chunk_log_probs, chunk_centered_logits
-                    if chunk_sequence_values is not None:
-                        del chunk_sequence_values
+                    del logits, chunk_log_probs, chunk_centered_logits, chunk_target_logits_probs
                     maybe_clear_memory(gc_collect=False, cuda_empty_cache=False, min_interval_s=120.0, logger=logger, tag="sweep_eps")
 
                 # Clear baseline logits after processing all epsilons for this chunk
-                del logits_base, chunk_log_probs_base, chunk_centered_logits_base
-                if chunk_sequence_values_base is not None:
-                    del chunk_sequence_values_base
+                del logits_base, chunk_log_probs_base, chunk_centered_logits_base, chunk_target_logits_probs_base
                 maybe_clear_memory(gc_collect=False, cuda_empty_cache=False, min_interval_s=120.0, logger=logger, tag="sweep_chunk_end")
             
             # Clear memory after processing all batches for this cluster
             maybe_clear_memory(gc_collect=False, cuda_empty_cache=False, min_interval_s=120.0, logger=logger, tag="sweep_cluster_end")
 
-    # Compute paper-facing centered/demeaned logit metrics.
+    # Compute metrics (including cluster mass metrics and centered logit metrics)
     computed_metrics = metrics.compute_steering_metrics(
+        dose_response, log_deltas, epsilons,
+        log_probs_steered=log_probs_steered,
+        log_probs_original=log_probs_original,
         centered_logits_steered=centered_logits_steered,
         centered_logits_original=centered_logits_original,
-        epsilons=epsilons,
+        target_logits_steered=target_logits_steered,
+        target_logits_original=target_logits_original,
+        target_probs_steered=target_probs_steered,
+        target_probs_original=target_probs_original,
     )
 
     result = {
@@ -1348,16 +1512,27 @@ def run_steering_sweep(
         'hc_selection': hc_selection,
         'top_B': top_B,
         'epsilon_values': epsilons,
-        'per_cluster_logit': computed_metrics['per_cluster_logit'],
-        'per_cluster_demeaned_logit': computed_metrics['per_cluster_demeaned_logit'],
-        'mean_logit_corr': computed_metrics['mean_logit_corr'],
-        'mean_logit_spearman': computed_metrics['mean_logit_spearman'],
-        'mean_demeaned_logit_corr': computed_metrics['mean_demeaned_logit_corr'],
-        'mean_demeaned_logit_spearman': computed_metrics['mean_demeaned_logit_spearman'],
+        'per_cluster': computed_metrics['per_cluster'],
+        'mean_r2': computed_metrics['mean_r2'],
+        'mean_corr': computed_metrics['mean_corr'],
+        'mean_win_r2': computed_metrics['mean_win_r2'],
+        'mean_win_corr': computed_metrics['mean_win_corr'],
+        'n_clusters_with_effect': computed_metrics['n_clusters_with_effect']
     }
 
-    if per_sequence_logit_values is not None:
-        result['per_sequence_logit_values'] = per_sequence_logit_values
+    # Add cluster mass metrics if available
+    if 'per_cluster_mass' in computed_metrics:
+        result['per_cluster_mass'] = computed_metrics['per_cluster_mass']
+
+    # Add centered logit metrics if available
+    if 'per_cluster_logit' in computed_metrics:
+        result['per_cluster_logit'] = computed_metrics['per_cluster_logit']
+    if 'mean_logit_r2' in computed_metrics:
+        result['mean_logit_r2'] = computed_metrics['mean_logit_r2']
+    if 'mean_logit_corr' in computed_metrics:
+        result['mean_logit_corr'] = computed_metrics['mean_logit_corr']
+    if 'mean_logit_spearman' in computed_metrics:
+        result['mean_logit_spearman'] = computed_metrics['mean_logit_spearman']
 
     if detailed_logs:
         result['detailed_logs'] = detailed_logs
@@ -1376,7 +1551,6 @@ def run_steering_sweep_prefix_batch(
     log_details: bool = False,
     max_batch_size: int = 128,
     max_seq_len: int = None,
-    store_sequence_logit_values: bool = False,
     logger = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Run steering sweep for a batch of prefixes using heterogeneous batching."""
@@ -1420,21 +1594,32 @@ def run_steering_sweep_prefix_batch(
                     decoder_cache[c], top_B, hc_selection
                 )
 
+        dose_response = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
+        log_deltas = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
+        log_probs_steered = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
+        log_probs_original = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
         centered_logits_steered = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
         centered_logits_original = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
-        per_sequence_logit_values = (
-            {c: {eps: [] for eps in epsilons} for c in cluster_ids}
-            if store_sequence_logit_values else None
-        )
+        target_logits_steered = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
+        target_logits_original = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
+        target_probs_steered = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
+        target_probs_original = {c: {eps: [] for eps in epsilons} for c in cluster_ids}
 
         per_prefix[prefix_id] = {
             "decoder_cache": decoder_cache,
             "baseline_metadata": baseline_metadata,
             "branches_by_cluster": branches_by_cluster,
             "selected_features_cache": selected_features_cache,
+            "dose_response": dose_response,
+            "log_deltas": log_deltas,
+            "log_probs_steered": log_probs_steered,
+            "log_probs_original": log_probs_original,
             "centered_logits_steered": centered_logits_steered,
             "centered_logits_original": centered_logits_original,
-            "per_sequence_logit_values": per_sequence_logit_values,
+            "target_logits_steered": target_logits_steered,
+            "target_logits_original": target_logits_original,
+            "target_probs_steered": target_probs_steered,
+            "target_probs_original": target_probs_original,
         }
         if log_details:
             detailed_logs_by_prefix[prefix_id] = []
@@ -1479,7 +1664,6 @@ def run_steering_sweep_prefix_batch(
                     "baseline_mean_centered_logit": meta.get("mean_centered_logit_original", 0.0),
                     "baseline_mean_target_logit": meta.get("mean_target_logit_original", 0.0),
                     "baseline_mean_target_prob": meta.get("mean_target_prob_original", 0.0),
-                    "baseline_sequence_values": _sequence_values_from_metadata(meta),
                     "features": features,
                     "decoder_cache": c_decoder_cache,
                 })
@@ -1509,10 +1693,7 @@ def run_steering_sweep_prefix_batch(
             chunk_centered_logits = steering.compute_per_token_centered_logits_batched(
                 logits, chunk_cont_info, return_per_token=log_details
             )
-            chunk_sequence_values = (
-                metrics.compute_per_token_logit_values_batched(logits, chunk_cont_info)
-                if store_sequence_logit_values else None
-            )
+            chunk_target_logits_probs = metrics.compute_mean_target_logit_and_prob_batched(logits, chunk_cont_info)
 
             for idx, (item, log_P) in enumerate(zip(chunk_items, chunk_log_probs)):
                 prefix_id = item["prefix_id"]
@@ -1524,23 +1705,22 @@ def run_steering_sweep_prefix_batch(
                 if info is None:
                     continue
 
+                info["log_deltas"][c_id][eps].append(delta)
                 rel_change = np.exp(delta) - 1.0
+                info["dose_response"][c_id][eps].append(rel_change)
+
+                info["log_probs_steered"][c_id][eps].append(log_P)
+                info["log_probs_original"][c_id][eps].append(item["baseline"])
 
                 _, mean_centered_logit_steered = chunk_centered_logits[idx]
                 info["centered_logits_steered"][c_id][eps].append(mean_centered_logit_steered)
                 info["centered_logits_original"][c_id][eps].append(item["baseline_mean_centered_logit"])
 
-                if store_sequence_logit_values:
-                    info["per_sequence_logit_values"][c_id][eps].append(
-                        _build_per_sequence_logit_record(
-                            branch_id=item["branch_id"],
-                            continuation_token_ids=item["cont_ids"],
-                            original_values=item["baseline_sequence_values"],
-                            steered_values=chunk_sequence_values[idx],
-                            log_prob_original=item["baseline"],
-                            log_prob_steered=log_P,
-                        )
-                    )
+                mean_target_logit_steered, mean_target_prob_steered = chunk_target_logits_probs[idx]
+                info["target_logits_steered"][c_id][eps].append(mean_target_logit_steered)
+                info["target_logits_original"][c_id][eps].append(item.get("baseline_mean_target_logit", 0.0))
+                info["target_probs_steered"][c_id][eps].append(mean_target_prob_steered)
+                info["target_probs_original"][c_id][eps].append(item.get("baseline_mean_target_prob", 0.0))
 
                 if log_details:
                     per_token_centered, _ = chunk_centered_logits[idx]
@@ -1556,29 +1736,29 @@ def run_steering_sweep_prefix_batch(
                         "mean_centered_logit_steered": float(mean_centered_logit_steered),
                         "mean_centered_logit_original": float(item["baseline_mean_centered_logit"]),
                         "per_token_centered_logits_steered": per_token_centered,
+                        "mean_target_logit_steered": float(mean_target_logit_steered),
                         "mean_target_logit_original": float(item.get("baseline_mean_target_logit", 0.0)),
+                        "mean_target_prob_steered": float(mean_target_prob_steered),
                         "mean_target_prob_original": float(item.get("baseline_mean_target_prob", 0.0)),
                     })
 
-            del logits, chunk_log_probs, chunk_centered_logits
-            if chunk_sequence_values is not None:
-                del chunk_sequence_values
+            del logits, chunk_log_probs, chunk_centered_logits, chunk_target_logits_probs
             maybe_clear_memory(gc_collect=False, cuda_empty_cache=False, min_interval_s=120.0, logger=logger, tag="prefix_sweep_chunk")
 
     for prefix_id, info in per_prefix.items():
         result = metrics.compute_steering_metrics(
+            info["dose_response"],
+            info["log_deltas"],
+            epsilons,
+            log_probs_steered=info["log_probs_steered"],
+            log_probs_original=info["log_probs_original"],
             centered_logits_steered=info["centered_logits_steered"],
             centered_logits_original=info["centered_logits_original"],
-            epsilons=epsilons,
+            target_logits_steered=info["target_logits_steered"],
+            target_logits_original=info["target_logits_original"],
+            target_probs_steered=info["target_probs_steered"],
+            target_probs_original=info["target_probs_original"],
         )
-        result.update({
-            "steering_method": steering_method,
-            "hc_selection": hc_selection,
-            "top_B": top_B,
-            "epsilon_values": epsilons,
-        })
-        if info.get("per_sequence_logit_values") is not None:
-            result["per_sequence_logit_values"] = info["per_sequence_logit_values"]
         if log_details:
             result["detailed_logs"] = detailed_logs_by_prefix.get(prefix_id, [])
         results_by_prefix[prefix_id] = result
@@ -1613,7 +1793,6 @@ def run_sweep_mode(
     if max_batch_size <= 0:
         max_batch_size = global_batch_size
     prefix_batch_size = steering_config.get("prefix_batch_size")
-    store_sequence_logit_values = bool(steering_config.get("store_sequence_logit_values", False))
     
     # Log center_Hc setting
     logger.info(f"H_c centering: {'enabled (Delta_H_c)' if center_Hc else 'disabled (H_0 + mu_a)'}")
@@ -1653,8 +1832,6 @@ def run_sweep_mode(
                     f"hc={sw.get('h_c_selections', sw.get('hc_selections'))} | B={sw.get('top_B')} | "
                     f"eps={sw.get('epsilon_values', sw.get('epsilons'))}")
     logger.info(f"Max samples/cluster: {max_cluster_samples}")
-    if store_sequence_logit_values:
-        logger.info("Per-sequence logit value storage enabled")
     primary_sweep_settings = _resolve_primary_sweep_settings(sweeps, steering_config)
 
     # Build aggregation keys (steering sweep keys)
@@ -1865,7 +2042,7 @@ def run_sweep_mode(
                     batch_size=effective_batch_size,
                     max_seq_len=max_seq_len,
                     progress=baseline_pbar,
-                    store_per_token=bool(log_details or store_sequence_logit_values),
+                    store_per_token=bool(log_details),
                 )
                 state["baseline_metadata"] = steering.compute_baseline_metadata(
                     state["baseline_branches"], baseline_branch_log_probs
@@ -1970,7 +2147,7 @@ def run_sweep_mode(
 
                 if run_h4a_sweeps and clustering_key not in aggregated_by_clustering:
                     aggregated_by_clustering[clustering_key] = {
-                        key: {'logit_corr': [], 'logit_spearman': []}
+                        key: {'r2': [], 'corr': [], 'win_r2': [], 'win_corr': [], 'logit_r2': [], 'logit_corr': []}
                         for key in all_keys
                     }
 
@@ -2033,7 +2210,6 @@ def run_sweep_mode(
                                 log_details=log_details,
                                 max_batch_size=max_batch_size,
                                 max_seq_len=max_seq_len,
-                                store_sequence_logit_values=store_sequence_logit_values,
                                 logger=logger,
                             )
                             for ctx in ctx_list:
@@ -2043,11 +2219,13 @@ def run_sweep_mode(
                                 prefix_results["clustering_runs"][clustering_key]["results"][key] = result
 
                                 agg_key = (method, hc_sel, top_B)
-                                if agg_key in aggregated_by_clustering[clustering_key] and (
-                                    'mean_logit_corr' in result or 'mean_logit_spearman' in result
-                                ):
+                                if agg_key in aggregated_by_clustering[clustering_key] and 'mean_r2' in result:
+                                    aggregated_by_clustering[clustering_key][agg_key]['r2'].append(result['mean_r2'])
+                                    aggregated_by_clustering[clustering_key][agg_key]['corr'].append(result.get('mean_corr', 0.0))
+                                    aggregated_by_clustering[clustering_key][agg_key]['win_r2'].append(result.get('mean_win_r2', 0.0))
+                                    aggregated_by_clustering[clustering_key][agg_key]['win_corr'].append(result.get('mean_win_corr', 0.0))
+                                    aggregated_by_clustering[clustering_key][agg_key]['logit_r2'].append(result.get('mean_logit_r2', 0.0))
                                     aggregated_by_clustering[clustering_key][agg_key]['logit_corr'].append(result.get('mean_logit_corr', 0.0))
-                                    aggregated_by_clustering[clustering_key][agg_key]['logit_spearman'].append(result.get('mean_logit_spearman', 0.0))
                         else:
                             for ctx in ctx_list:
                                 prefix_id = ctx["prefix_id"]
@@ -2067,18 +2245,19 @@ def run_sweep_mode(
                                     max_batch_size=max_batch_size,
                                     cross_prefix_batching=cross_prefix_batching,
                                     max_seq_len=max_seq_len,
-                                    store_sequence_logit_values=store_sequence_logit_values,
                                     logger=logger,
                                 )
 
                                 prefix_results["clustering_runs"][clustering_key]["results"][key] = result
 
                                 agg_key = (method, hc_sel, top_B)
-                                if agg_key in aggregated_by_clustering[clustering_key] and (
-                                    'mean_logit_corr' in result or 'mean_logit_spearman' in result
-                                ):
+                                if agg_key in aggregated_by_clustering[clustering_key] and 'mean_r2' in result:
+                                    aggregated_by_clustering[clustering_key][agg_key]['r2'].append(result['mean_r2'])
+                                    aggregated_by_clustering[clustering_key][agg_key]['corr'].append(result.get('mean_corr', 0.0))
+                                    aggregated_by_clustering[clustering_key][agg_key]['win_r2'].append(result.get('mean_win_r2', 0.0))
+                                    aggregated_by_clustering[clustering_key][agg_key]['win_corr'].append(result.get('mean_win_corr', 0.0))
+                                    aggregated_by_clustering[clustering_key][agg_key]['logit_r2'].append(result.get('mean_logit_r2', 0.0))
                                     aggregated_by_clustering[clustering_key][agg_key]['logit_corr'].append(result.get('mean_logit_corr', 0.0))
-                                    aggregated_by_clustering[clustering_key][agg_key]['logit_spearman'].append(result.get('mean_logit_spearman', 0.0))
 
                         maybe_clear_memory(gc_collect=False, cuda_empty_cache=False, min_interval_s=120.0, logger=logger, tag="prefix_batch_end")
 
@@ -2342,18 +2521,10 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     reset_cuda_state()
-    backend_arg = resolve_stage_backend(config, "stage_7c_steering")
-    backend = resolve_backend(model_name, backend_arg)
     logger.info(f"Loading model {model_name}...")
-    logger.info("Using Stage 7c backend=%s for model=%s", backend, model_name)
     model = ReplacementModel.from_pretrained(
-        model_name,
-        transcoder_set,
-        backend=backend,
-        device=device,
-        dtype=torch.bfloat16,
-        lazy_encoder=True,
-        lazy_decoder=False,
+        model_name, transcoder_set, device=device, dtype=torch.bfloat16,
+        lazy_encoder=True, lazy_decoder=False
     )
     try:
         logger.info(f"CUDA available: {torch.cuda.is_available()} (device_count={torch.cuda.device_count()})")

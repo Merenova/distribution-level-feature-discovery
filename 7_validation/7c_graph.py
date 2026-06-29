@@ -15,7 +15,6 @@ import numpy as np
 import torch
 
 from utils.data_utils import reconstruct_active_features
-from utils.model_backend import get_model_dtype
 
 # Import shared utilities (using same pattern as other modules)
 import importlib.util
@@ -462,6 +461,84 @@ def select_top_features_by_magnitude(
     return features
 
 
+def select_top_features_by_distinctiveness(
+    cluster_id: int,
+    all_semantic_graphs: Dict[int, np.ndarray],
+    active_features: torch.Tensor,
+    selected_features: torch.Tensor,
+    top_B: int = 50
+) -> List[Tuple[int, int, int, float]]:
+    """Select top-B features that are DISTINCT to this cluster.
+
+    Distinctiveness score: |H_c[i]| / (max(|H_c'[i]|) + epsilon) for c' != c
+    High score means this cluster has high activation where others have low.
+
+    Args:
+        cluster_id: Current cluster ID
+        all_semantic_graphs: Dict of {cluster_id: H_c} for all clusters
+        active_features: Tensor mapping feat_idx -> (layer, pos, feat_id)
+        selected_features: Tensor mapping H_c index -> active_features index
+        top_B: Number of top features to select
+
+    Returns:
+        List of (layer, pos, feat_id, H_c_value) tuples
+    """
+    H_c = all_semantic_graphs[cluster_id]
+    n_features = len(selected_features)
+    top_indices = _select_top_feature_indices(
+        cluster_id=cluster_id,
+        semantic_graphs=all_semantic_graphs,
+        n_features=n_features,
+        top_B=top_B,
+        selection_mode="distinct",
+    )
+
+    features = []
+    for idx in top_indices:
+        feat_idx = selected_features[idx].item()
+        layer, pos, feat_id = active_features[feat_idx].tolist()
+        H_c_value = float(H_c[:n_features][idx])  # Original signed value
+        features.append((int(layer), int(pos), int(feat_id), H_c_value))
+
+    return features
+
+
+def select_top_features_from_Hc(
+    H_c: np.ndarray,
+    active_features: torch.Tensor,
+    selected_features: torch.Tensor,
+    top_B: int = 50,
+    selection_mode: str = "magnitude",
+    cluster_id: int = None,
+    all_semantic_graphs: Dict[int, np.ndarray] = None
+) -> List[Tuple[int, int, int, float]]:
+    """Select top-B features using specified selection mode.
+
+    Args:
+        H_c: Semantic graph for this cluster
+        active_features: Tensor mapping feat_idx -> (layer, pos, feat_id)
+        selected_features: Tensor mapping H_c index -> active_features index
+        top_B: Number of top features to select
+        selection_mode: "magnitude" (default) or "distinct"
+        cluster_id: Required for "distinct" mode
+        all_semantic_graphs: Required for "distinct" mode
+
+    Returns:
+        List of (layer, pos, feat_id, H_c_value) tuples
+    """
+    if selection_mode == "distinct":
+        if cluster_id is None or all_semantic_graphs is None:
+            raise ValueError("cluster_id and all_semantic_graphs required for 'distinct' mode")
+        return select_top_features_by_distinctiveness(
+            cluster_id, all_semantic_graphs, active_features, selected_features, top_B
+        )
+    else:
+        # Default: magnitude
+        return select_top_features_by_magnitude(
+            H_c, active_features, selected_features, top_B
+        )
+
+
 def select_features_with_hc_selection(
     cache_data: Dict,
     top_B: int,
@@ -512,6 +589,60 @@ def select_features_with_hc_selection(
     )
 
 
+# =============================================================================
+# Decoder Vector Precomputation
+# =============================================================================
+
+def precompute_decoder_vectors_global(
+    model,
+    active_features: torch.Tensor,
+    selected_features: torch.Tensor,
+    device: torch.device,
+    max_features: int = 1000
+) -> Dict[int, torch.Tensor]:
+    """Precompute decoder vectors for top features ONCE (shared across h_c_strategies).
+
+    This is called once per prefix and cached. The decoder vectors only depend on
+    (layer, feat_id), not on cluster assignment.
+
+    Args:
+        model: ReplacementModel with transcoders
+        active_features: Tensor mapping feat_idx -> (layer, pos, feat_id)
+        selected_features: Tensor mapping H_c index -> active_features index
+        device: Torch device
+        max_features: Maximum features to precompute
+
+    Returns:
+        {h_c_idx: decoder_vector} - maps H_c index to its decoder vector
+    """
+    n_features = min(len(selected_features), max_features)
+
+    # Group features by layer for batched fetching
+    layer_to_indices = {}
+    for h_c_idx in range(n_features):
+        feat_idx = selected_features[h_c_idx].item()
+        layer, pos, feat_id = active_features[feat_idx].tolist()
+        layer = int(layer)
+        if layer not in layer_to_indices:
+            layer_to_indices[layer] = []
+        layer_to_indices[layer].append((h_c_idx, int(feat_id)))
+
+    # Batch fetch decoder vectors per layer
+    decoder_cache = {}
+    for layer, idx_list in layer_to_indices.items():
+        h_c_indices = [x[0] for x in idx_list]
+        feat_ids = [x[1] for x in idx_list]
+
+        # Batch fetch all decoder vectors for this layer
+        feat_ids_t = torch.tensor(feat_ids, device=device, dtype=torch.long)
+        dec_vecs = model.transcoders._get_decoder_vectors(layer, feat_ids_t)
+
+        for i, h_c_idx in enumerate(h_c_indices):
+            decoder_cache[h_c_idx] = dec_vecs[i]
+
+    return decoder_cache
+
+
 def build_cluster_decoder_cache(
     semantic_graphs: Dict[int, np.ndarray],
     global_decoder_cache: Dict[int, torch.Tensor],
@@ -520,14 +651,14 @@ def build_cluster_decoder_cache(
     max_features: int = 1000,
     selection_mode: str = "magnitude",
 ) -> Dict[int, Dict]:
-    """Build per-cluster decoder cache from caller-provided decoder vectors.
+    """Build per-cluster decoder cache from global cache (fast - no model calls).
 
-    The global decoder cache maps H_c-local feature indices to decoder vectors
-    and is prepared by the caller.
+    This uses the precomputed global decoder cache to build per-cluster caches
+    based on H_c values. Called once per clustering config (but very fast).
 
     Args:
         semantic_graphs: {cluster_id: H_c array}
-        global_decoder_cache: {h_c_idx: decoder_vector}
+        global_decoder_cache: {h_c_idx: decoder_vector} from precompute_decoder_vectors_global
         active_features: Tensor mapping feat_idx -> (layer, pos, feat_id)
         selected_features: Tensor mapping H_c index -> active_features index
         max_features: Maximum features per cluster
@@ -705,11 +836,7 @@ def precompute_cluster_decoder_vectors(
             positions = [x[0] for x in items]
             feat_ids_list = [x[1] for x in items]
             feat_ids_tensor = torch.tensor(feat_ids_list, device=device, dtype=torch.long)
-            h_c_vals = torch.tensor(
-                [x[2] for x in items],
-                device=device,
-                dtype=get_model_dtype(model, fallback=torch.float32),
-            )
+            h_c_vals = torch.tensor([x[2] for x in items], device=device, dtype=model.cfg.dtype)
 
             # Get decoder vectors ONCE per cluster per layer
             decoder_vecs = model.transcoders._get_decoder_vectors(layer, feat_ids_tensor)

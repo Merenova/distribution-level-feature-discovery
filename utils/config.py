@@ -1,14 +1,21 @@
-"""Configuration management for Gaussian optimization experiments."""
+"""Configuration helpers for the paper-aligned pipeline."""
 
+import argparse
+import copy
 import json
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any
+
+
+ConfigDict = dict[str, Any]
 
 
 @dataclass
 class ModelConfig:
     """Configuration for model and transcoder."""
+
     base_model: str = "Qwen/Qwen3-8B"
     transcoder: str = "mwhanna/qwen3-8b-transcoders"
     dtype: str = "bfloat16"
@@ -18,293 +25,200 @@ class ModelConfig:
 @dataclass
 class SamplingConfig:
     """Configuration for branch sampling."""
-    n_samples: int = 1024  # N_x: number of continuations per prefix
-    nucleus_p: float = 0.95  # Top-p for nucleus sampling
-    temperature: float = 1.0  # Temperature for sampling
-    max_tokens: int = 50  # Maximum tokens per continuation
-    stop_tokens: list[str] = field(default_factory=lambda: [".", "?", "!"])  # Punctuation stopping
-    batch_size: int = 32  # Batch size for vLLM sampling
-    format_prefix: bool = True  # Whether to apply chat template to prefix
+
+    nucleus_p: float = 0.9
+    temperature: float = 1.0
+    max_tokens: int = 20
+    stop_tokens: list[str] = field(default_factory=lambda: [".", "?", "!"])
+    batch_size: int = 32
 
 
 @dataclass
 class EmbeddingConfig:
-    """Configuration for semantic embeddings."""
+    """Configuration for contextual continuation embeddings."""
+
     model_name: str = "google/embeddinggemma-300m"
-    embed_full_sequence: bool = True  # Embed prefix + continuation
     batch_size: int = 32
     device: str = "cuda"
 
 
 @dataclass
-class AttributionConfig:
-    """Configuration for attribution graph extraction."""
-    use_circuit_tracer: bool = True
-    batch_size: int = 16
-    device: str = "cuda"
-
-
-@dataclass
-class ClusteringConfig:
-    """Configuration for legacy (threshold-based) Gaussian clustering algorithm."""
-    K_0: int = 3  # Initial number of components
-    max_iterations: int = 50  # Maximum EM iterations
-    convergence_threshold: float = 1e-4  # Convergence criterion
-
-    # Thresholds for dynamic operations
-    tau_clone: float = 2.0  # Reconstruction error threshold for cloning
-    tau_split_a: float = 10.0  # Attribution variance threshold for splitting
-
-    # Size constraints
-    n_min: int = 8  # Minimum component size
-    T_max_split: int = 2  # Maximum split attempts per component
-    K_clone: int = 5  # Maximum clones per iteration
-
-    # Probability weighting
-    prob_temperature: float = 1.0  # Temperature for probability weights (β in P_n^β)
-
-
-@dataclass
-class RateDistortionConfig:
-    """Configuration for rate-distortion based clustering.
-
-    Uses principled information-theoretic criteria instead of hand-tuned thresholds.
-    Objective: L_RD = H(C) + β_e D^(e) + β_a D^(a)
-
-    Note: No tunable thresholds - all operations use exact R-D criteria.
-    """
-    # Clustering method
-    method: str = "rate_distortion"
-
-    # Rate-distortion tradeoff (equal weights by default)
-    beta_e: float = 1.0  # Semantic distortion weight
-    beta_a: float = 1.0  # Attribution distortion weight
-
-    # Capacity constraints
-    K_max: int = 20  # Maximum number of components
-
-    # Convergence
-    max_iterations: int = 50  # Maximum EM iterations
-    convergence_threshold: float = 1e-6  # Relative change in L_RD
-
-
-@dataclass
-class AnnealingConfig:
-    """Configuration for β-annealing.
-
-    β-annealing runs clustering across a range of β values, using warm-start
-    from previous solution. This traces the rate-distortion curve.
-
-    Per tex Section 7: Run for β ∈ [β_min, β_max] (log-spaced, ascending),
-    using previous solution as warm start.
-    """
-    enabled: bool = False  # Whether to run annealing
-    beta_min: float = 0.1  # Starting β (low = favor compression, fewer clusters)
-    beta_max: float = 10.0  # Ending β (high = favor reconstruction, more clusters)
-    n_steps: int = 20  # Number of β values (log-spaced)
-    gamma: float = 0.5  # View ratio: β_e = γβ, β_a = (1-γ)β
-
-
-@dataclass
 class PathConfig:
-    """Path configuration for project directories."""
-    # Derive project root from this file's location
+    """Project-relative paths for the clean duplicate."""
+
     project_root: Path = field(default_factory=lambda: Path(__file__).resolve().parents[1])
-
-    # Parent projects (optional, only used for cross-project references)
-    knowledge_attribution: Path = field(default_factory=lambda: Path(__file__).resolve().parents[3] / "knowledge_attribution")
-    qwen_pilot: Path = field(default_factory=lambda: Path(__file__).resolve().parents[3] / "qwen_pilot")
-
-    # Circuit-tracer (relative to project root)
     circuit_tracer: Path = field(default_factory=lambda: Path(__file__).resolve().parents[1] / "circuit-tracer")
+    results: Path = field(default_factory=lambda: Path(__file__).resolve().parents[1] / "results")
+    logs: Path = field(default_factory=lambda: Path(__file__).resolve().parents[1] / "logs")
 
-    # Source code directories (numbered stages)
-    data_preparation: Optional[Path] = None
-    attribution_graphs: Optional[Path] = None
-    branch_sampling: Optional[Path] = None
-    feature_extraction: Optional[Path] = None
-    gaussian_clustering: Optional[Path] = None
-    semantic_graphs: Optional[Path] = None
-
-    # Results directory structure
-    results: Optional[Path] = None
-    results_attribution_graphs: Optional[Path] = None
-    results_branch_sampling: Optional[Path] = None
-    results_feature_extraction: Optional[Path] = None
-    results_clustering: Optional[Path] = None
-    results_semantic_graphs: Optional[Path] = None
-    results_validation: Optional[Path] = None
-    results_visualization: Optional[Path] = None
-
-    # Validation subdirectories
-    validation_7a: Optional[Path] = None
-    validation_7b: Optional[Path] = None
-    validation_7c: Optional[Path] = None
-
-    # Support directories
-    logs: Optional[Path] = None
-    configs: Optional[Path] = None
-    manifests: Optional[Path] = None
-
-    # Legacy (deprecated)
-    test_results: Optional[Path] = None
-
-    def __post_init__(self):
-        """Initialize relative paths."""
-        # Source code directories
-        self.data_preparation = self.project_root / "1_data_preparation"
+    def __post_init__(self) -> None:
         self.branch_sampling = self.project_root / "2_branch_sampling"
         self.attribution_graphs = self.project_root / "3_attribution_graphs"
         self.feature_extraction = self.project_root / "4_feature_extraction"
         self.gaussian_clustering = self.project_root / "5_gaussian_clustering"
         self.semantic_graphs = self.project_root / "6_semantic_graphs"
+        self.validation = self.project_root / "7_validation"
 
-        # Results directory structure (numbered)
-        self.results = self.project_root / "results"
         self.results_branch_sampling = self.results / "2_branch_sampling"
         self.results_attribution_graphs = self.results / "3_attribution_graphs"
         self.results_feature_extraction = self.results / "4_feature_extraction"
         self.results_clustering = self.results / "5_clustering"
         self.results_semantic_graphs = self.results / "6_semantic_graphs"
         self.results_validation = self.results / "7_validation"
-        self.results_visualization = self.results / "8_visualization"
 
-        # Validation subdirectories
-        self.validation_7a = self.results_validation / "7a_graph_validation"
-        self.validation_7b = self.results_validation / "7b_clustering_sweep"
-        self.validation_7c = self.results_validation / "7c_steering"
-
-        # Support directories
-        self.logs = self.project_root / "logs"
-        self.configs = self.results / "configs"
-        self.manifests = self.results / "manifests"
-
-        # Legacy (deprecated)
-        self.test_results = self.project_root / "test_results"
-
-    def ensure_dirs(self):
-        """Create all directories if they don't exist."""
+    def ensure_dirs(self) -> None:
         for path in [
             self.results,
-            self.results_attribution_graphs,
+            self.logs,
             self.results_branch_sampling,
+            self.results_attribution_graphs,
             self.results_feature_extraction,
             self.results_clustering,
             self.results_semantic_graphs,
             self.results_validation,
-            self.results_visualization,
-            self.validation_7a,
-            self.validation_7b,
-            self.validation_7c,
-            self.logs,
-            self.configs,
-            self.manifests,
         ]:
-            if path:
-                path.mkdir(parents=True, exist_ok=True)
+            path.mkdir(parents=True, exist_ok=True)
 
 
-@dataclass
-class ExperimentConfig:
-    """Complete experiment configuration."""
-    model: ModelConfig = field(default_factory=ModelConfig)
-    sampling: SamplingConfig = field(default_factory=SamplingConfig)
-    embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
-    attribution: AttributionConfig = field(default_factory=AttributionConfig)
-    clustering: ClusteringConfig = field(default_factory=ClusteringConfig)
-    paths: PathConfig = field(default_factory=PathConfig)
+def deep_merge(base: ConfigDict, overlay: ConfigDict) -> ConfigDict:
+    """Recursively merge overlay into base without mutating either input."""
 
-    # Experiment metadata
-    experiment_name: str = "gaussian_test"
-    num_test_prefixes: int = 10
-    random_seed: int = 42
-
-
-def load_clustering_config_from_json(config_path: Path) -> ClusteringConfig:
-    """Load legacy clustering configuration from JSON file.
-
-    Args:
-        config_path: Path to JSON config file
-
-    Returns:
-        ClusteringConfig with values from JSON
-    """
-    with open(config_path) as f:
-        config = json.load(f)
-
-    clustering_dict = config.get("clustering", {})
-
-    return ClusteringConfig(
-        K_0=clustering_dict.get("K_0", 3),
-        max_iterations=clustering_dict.get("max_iterations", 50),
-        convergence_threshold=clustering_dict.get("convergence_threshold", 1e-4),
-        tau_clone=clustering_dict.get("tau_clone", 2.0),
-        tau_split_a=clustering_dict.get("tau_split_a", 100.0),
-        n_min=clustering_dict.get("n_min", 8),
-        T_max_split=clustering_dict.get("T_max_split", 2),
-        K_clone=clustering_dict.get("K_clone", 5),
-        prob_temperature=clustering_dict.get("prob_temperature", 1.0),
-    )
+    merged = copy.deepcopy(base)
+    for key, value in overlay.items():
+        if (
+            key in merged
+            and isinstance(merged[key], dict)
+            and isinstance(value, dict)
+        ):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
 
 
-def load_rd_config_from_json(config_path: Path) -> RateDistortionConfig:
-    """Load rate-distortion clustering configuration from JSON file.
+def load_config(path: str | Path, _seen: set[Path] | None = None) -> ConfigDict:
+    """Load a JSON config, recursively resolving relative ``extends`` entries."""
 
-    Args:
-        config_path: Path to JSON config file
+    config_path = Path(path).expanduser().resolve()
+    seen = set() if _seen is None else set(_seen)
+    if config_path in seen:
+        cycle = " -> ".join(str(p) for p in [*seen, config_path])
+        raise ValueError(f"Config extends cycle detected: {cycle}")
+    seen.add(config_path)
 
-    Returns:
-        RateDistortionConfig with values from JSON
-    """
-    with open(config_path) as f:
-        config = json.load(f)
+    with config_path.open("r", encoding="utf-8") as file:
+        raw_config = json.load(file)
+    if not isinstance(raw_config, dict):
+        raise ValueError(f"Config file must contain a JSON object: {config_path}")
 
-    clustering_dict = config.get("clustering", {})
+    extends = raw_config.get("extends", [])
+    if isinstance(extends, str):
+        extend_paths = [extends]
+    elif isinstance(extends, list):
+        extend_paths = extends
+    else:
+        raise ValueError(f"Config extends must be a string or list: {config_path}")
 
-    return RateDistortionConfig(
-        method=clustering_dict.get("method", "rate_distortion"),
-        beta_e=clustering_dict.get("beta_e", 1.0),
-        beta_a=clustering_dict.get("beta_a", 1.0),
-        K_max=clustering_dict.get("K_max", 20),
-        max_iterations=clustering_dict.get("max_iterations", 50),
-        convergence_threshold=clustering_dict.get("convergence_threshold", 1e-6),
-    )
+    resolved: ConfigDict = {}
+    for extend_path in extend_paths:
+        if not isinstance(extend_path, str):
+            raise ValueError(f"Config extends entries must be strings: {config_path}")
+        parent_config = load_config(config_path.parent / extend_path, seen)
+        resolved = deep_merge(resolved, parent_config)
 
-
-def load_annealing_config_from_json(config_path: Path) -> AnnealingConfig:
-    """Load β-annealing configuration from JSON file.
-
-    Args:
-        config_path: Path to JSON config file
-
-    Returns:
-        AnnealingConfig with values from JSON
-    """
-    with open(config_path) as f:
-        config = json.load(f)
-
-    annealing_dict = config.get("annealing", {})
-
-    return AnnealingConfig(
-        enabled=annealing_dict.get("enabled", False),
-        beta_min=annealing_dict.get("beta_min", 0.1),
-        beta_max=annealing_dict.get("beta_max", 10.0),
-        n_steps=annealing_dict.get("n_steps", 20),
-        gamma=annealing_dict.get("gamma", 0.5),
-    )
+    overlay = {key: value for key, value in raw_config.items() if key != "extends"}
+    return deep_merge(resolved, overlay)
 
 
-def get_clustering_method(config_path: Path) -> str:
-    """Determine clustering method from config file.
+def write_resolved_config(path: str | Path, output_path: str | Path) -> ConfigDict:
+    """Resolve a config and write the fully expanded JSON representation."""
 
-    Args:
-        config_path: Path to JSON config file
+    resolved = load_config(path)
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(resolved, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return resolved
 
-    Returns:
-        Method name: "rate_distortion" or "legacy"
-    """
-    with open(config_path) as f:
-        config = json.load(f)
 
-    clustering_dict = config.get("clustering", {})
-    return clustering_dict.get("method", "rate_distortion")
+def _get_nested(config: ConfigDict, *keys: str) -> Any:
+    current: Any = config
+    for key in keys:
+        if not isinstance(current, dict) or key not in current:
+            return None
+        current = current[key]
+    return current
+
+
+def _shell_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def config_to_shell_exports(config: ConfigDict) -> dict[str, str]:
+    """Convert resolved config values into runner environment variables."""
+
+    mappings: dict[str, tuple[str, ...]] = {
+        "EXPERIMENT_NAME": ("experiment_name",),
+        "RANDOM_SEED": ("random_seed",),
+        "DATASET_NAME": ("data", "dataset"),
+        "DATA_ADAPTER": ("data", "adapter"),
+        "MODEL_NAME": ("model", "base_model"),
+        "TRANSCODER_NAME": ("model", "transcoder"),
+        "MODEL_DTYPE": ("model", "dtype"),
+        "GPU_MEMORY": ("vllm", "gpu_memory_utilization"),
+        "TENSOR_PARALLEL": ("vllm", "tensor_parallel_size"),
+        "MAX_MODEL_LEN": ("vllm", "max_model_len"),
+        "TRUST_REMOTE_CODE": ("vllm", "trust_remote_code"),
+        "MAX_TOTAL_CONTINUATIONS": ("sampling", "max_total_continuations"),
+        "NUCLEUS_P": ("sampling", "nucleus_p"),
+        "TEMPERATURE": ("sampling", "temperature"),
+        "SAMPLING_MAX_TOKENS": ("sampling", "max_tokens"),
+        "SAMPLING_BATCH_SIZE": ("sampling", "batch_size"),
+        "SAMPLING_MAX_BATCHES": ("sampling", "max_batches"),
+        "ATTR_MAX_FEATURES": ("attribution", "max_feature_nodes"),
+        "ATTR_BATCH_SIZE": ("attribution", "batch_size"),
+        "EMBEDDING_MODEL": ("embedding", "model_name"),
+        "EMBEDDING_BATCH_SIZE": ("embedding", "batch_size"),
+        "DATA_SPLIT_DEFAULT": ("data", "split"),
+        "STAGE1_N_GROUPS": ("stage_1_data_prep", "n_groups"),
+    }
+
+    exports: dict[str, str] = {}
+    for export_name, keys in mappings.items():
+        value = _get_nested(config, *keys)
+        if value is not None:
+            exports[export_name] = _shell_value(value)
+    return exports
+
+
+def print_shell_exports(config: ConfigDict) -> None:
+    """Print shell export statements for the resolved config."""
+
+    for key, value in config_to_shell_exports(config).items():
+        print(f"export {key}={shlex.quote(value)}")
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Resolve composable JSON configs.")
+    parser.add_argument("config", type=Path, help="Config JSON file to resolve")
+    parser.add_argument("--shell-env", action="store_true", help="Print shell exports")
+    parser.add_argument("--json", action="store_true", help="Print resolved JSON")
+    parser.add_argument("--write", type=Path, help="Write resolved JSON to this path")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    config = load_config(args.config)
+
+    if args.write:
+        write_resolved_config(args.config, args.write)
+    if args.shell_env:
+        print_shell_exports(config)
+    if args.json or not args.shell_env:
+        print(json.dumps(config, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

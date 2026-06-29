@@ -1,59 +1,38 @@
-"""Attribution graph and prefix-to-continuation helpers."""
+"""Attribution graph computation for circuit tracing."""
 
-from __future__ import annotations
+# Import context classes directly (no circular import issue)
+from circuit_tracer.attribution.context import (
+    PrefixAttributionContext,
+    ContinuationAttributionContext,
+)
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from circuit_tracer.attribution.attribute import attribute
-    from circuit_tracer.attribution.attribute_prefix import (
-        attribute_prefix_to_continuations,
-        setup_prefix_context,
-    )
-    from circuit_tracer.attribution.prefix_context import (
-        ContinuationTokenAttribution,
-        PrefixAttributionContext,
-        PrefixContinuationResult,
-    )
-
-__all__ = [
-    "ContinuationTokenAttribution",
-    "PrefixAttributionContext",
-    "PrefixContinuationResult",
-    "attribute",
-    "attribute_prefix_to_continuations",
-    "setup_prefix_context",
-]
+# Lazy imports for attribute.py to avoid circular import with replacement_model.py
+_lazy_imports = {
+    "attribute": "circuit_tracer.attribution.attribute",
+    "compute_salient_logits": "circuit_tracer.attribution.attribute",
+    "attribute_prefix_to_continuations": "circuit_tracer.attribution.attribute",
+    "setup_prefix_context": "circuit_tracer.attribution.attribute",
+    "ContinuationTokenAttribution": "circuit_tracer.attribution.attribute",
+    "PrefixContinuationResult": "circuit_tracer.attribution.attribute",
+}
 
 
 def __getattr__(name):
-    lazy_imports = {
-        "attribute": ("circuit_tracer.attribution.attribute", "attribute"),
-        "attribute_prefix_to_continuations": (
-            "circuit_tracer.attribution.attribute_prefix",
-            "attribute_prefix_to_continuations",
-        ),
-        "setup_prefix_context": (
-            "circuit_tracer.attribution.attribute_prefix",
-            "setup_prefix_context",
-        ),
-        "ContinuationTokenAttribution": (
-            "circuit_tracer.attribution.prefix_context",
-            "ContinuationTokenAttribution",
-        ),
-        "PrefixAttributionContext": (
-            "circuit_tracer.attribution.prefix_context",
-            "PrefixAttributionContext",
-        ),
-        "PrefixContinuationResult": (
-            "circuit_tracer.attribution.prefix_context",
-            "PrefixContinuationResult",
-        ),
-    }
+    if name in _lazy_imports:
+        module_name = _lazy_imports[name]
+        import importlib
+        module = importlib.import_module(module_name)
+        return getattr(module, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-    if name in lazy_imports:
-        module_name, attr_name = lazy_imports[name]
-        module = __import__(module_name, fromlist=[attr_name])
-        return getattr(module, attr_name)
 
-    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+__all__ = [
+    "attribute",
+    "compute_salient_logits",
+    "attribute_prefix_to_continuations",
+    "setup_prefix_context",
+    "ContinuationTokenAttribution",
+    "PrefixContinuationResult",
+    "PrefixAttributionContext",
+    "ContinuationAttributionContext",
+]

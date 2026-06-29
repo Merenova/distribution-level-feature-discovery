@@ -1,0 +1,12 @@
+{
+  "random_seed": 42,
+  "global": {"max_seq_len": 64},
+  "data": {"dataset": "ambigqa", "adapter": "ambigqa", "split": "train"},
+  "stage_1_data_prep": {"n_groups": 100},
+  "vllm": {"gpu_memory_utilization": 0.95, "tensor_parallel_size": 1, "max_model_len": 96, "trust_remote_code": true},
+  "sampling": {"max_total_continuations": 500, "nucleus_p": 0.9, "temperature": 1.0, "max_tokens": 20, "batch_size": 32, "max_batches": 200},
+  "attribution": {"batch_size": 128, "max_feature_nodes": 4096},
+  "embedding": {"model_name": "google/embeddinggemma-300m", "batch_size": 32},
+  "clustering": {"K_max": 10, "K_clamp": 10, "max_iterations": 50, "convergence_threshold": 0.001, "attribution_metric": "l1", "sweeps": {"beta_values": [0.5, 0.75, 1.0, 1.25], "gamma_values": [0.1, 0.3, 0.5, 0.7, 0.9], "n_workers": 4}},
+  "stage_7c_steering": {"feature_selection": "magnitude", "K_clamp": 10, "max_cluster_samples": 10, "max_batch_size": 256, "sweeps": [{"name": "paper_sign", "steering_method": "sign", "h_c_selections": ["full", "positive", "negative"], "top_B": [5, 10], "epsilon_values": [-1.0, -0.5, -0.1, 0.1, 0.5, 1.0]}]}
+}

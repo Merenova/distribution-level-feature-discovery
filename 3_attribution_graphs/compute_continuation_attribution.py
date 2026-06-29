@@ -25,16 +25,12 @@ CIRCUIT_TRACER_PATH = Path(__file__).resolve().parents[1] / "circuit-tracer"
 sys.path.insert(0, str(CIRCUIT_TRACER_PATH))
 
 from circuit_tracer import ReplacementModel
-from circuit_tracer.attribution import (
-    ContinuationTokenAttribution,
-    attribute_prefix_to_continuations,
-)
+from circuit_tracer.attribution import attribute_prefix_to_continuations
+from circuit_tracer.attribution.attribute import ContinuationTokenAttribution
 
 from utils.config import PathConfig
 from utils.data_utils import load_json, save_json
 from utils.logging_utils import setup_logger
-from utils.manifest import filter_samples_by_manifest, update_manifest_with_results
-from utils.model_backend import resolve_backend
 
 
 def aggregate_attributions(
@@ -70,7 +66,6 @@ def process_prefix(
     batch_size: int,
     output_dir: Path,
     logger,
-    store_all: bool = False,
 ) -> Tuple[Path, Path]:
     """Process all continuations for a single prefix.
 
@@ -82,8 +77,6 @@ def process_prefix(
         batch_size: How many continuation tokens to process per backward pass
         output_dir: Directory for output files
         logger: Logger instance
-        store_all: If True, store all token-level attributions for later processing
-
     Returns:
         Tuple of (prefix_context_path, attribution_path)
     """
@@ -146,22 +139,14 @@ def process_prefix(
     logger.info(f"    Prefix tokens: {result.prefix_context.n_prefix_tokens}")
     logger.info(f"    Total prefix sources: {result.prefix_context.n_prefix_sources}")
 
-    # Aggregate attributions by span mode (or store all for deferred processing)
-    logger.info(f"  Processing attributions (span_mode=full, store_all={store_all})...")
+    logger.info("  Processing attributions (full continuation mean/sum summary)...")
     aggregated = []
-    token_level_attributions = [] if store_all else None  # Only collect if store_all=True
     span_info = []
 
     for i, token_attrs in enumerate(result.continuation_attributions):
         start, end = 0, len(token_attrs)
         agg = aggregate_attributions(token_attrs, start, end)
         aggregated.append(agg)
-
-        # Store individual token-level attributions only if store_all=True
-        if store_all:
-            # Shape: (n_tokens_in_continuation, n_prefix_sources)
-            per_token_tensor = torch.stack([attr.source_attribution.cpu() for attr in token_attrs])
-            token_level_attributions.append(per_token_tensor)
 
         span_info.append({
             "start": start,
@@ -173,10 +158,6 @@ def process_prefix(
     # Stack aggregated attributions
     aggregated_tensor = torch.stack(aggregated)  # (n_continuations, n_prefix_sources)
     logger.info(f"  Aggregated attribution shape: {aggregated_tensor.shape}")
-
-    if store_all:
-        logger.info(f"  Token attributions: {len(token_level_attributions)} continuations, "
-                    f"lengths {[t.shape[0] for t in token_level_attributions[:5]]}...")
 
     # Save prefix context for downstream stages (clustering, intervention)
     prefix_ctx = result.prefix_context
@@ -197,16 +178,8 @@ def process_prefix(
         "n_prefix_tokens": prefix_ctx.n_prefix_tokens,
         "n_prefix_sources": prefix_ctx.n_prefix_sources,
         "prefix_length": prefix_ctx.prefix_length,
-        # Attribution tensors
-        "aggregated_attributions": aggregated_tensor,  # sum over selected continuation span
-        "aggregated_attributions_pooling": "sum",
-        "span_info": span_info,
-        "store_all": store_all,  # Flag indicating if token_attributions is present
+        "aggregated_attributions": aggregated_tensor,  # (n_continuations, n_prefix_sources)
     }
-    # Only store token-level attributions and continuation tokens if store_all=True
-    if store_all:
-        context_data["token_attributions"] = token_level_attributions  # list of (n_tokens, n_prefix_sources) tensors
-        context_data["continuation_tokens"] = all_continuations  # list of token id lists (for recomputing spans)
 
     context_file = output_dir / f"{prefix_id}_prefix_context.pt"
     torch.save(context_data, context_file)
@@ -215,14 +188,11 @@ def process_prefix(
     # Save metadata as JSON (for easy inspection, no large tensors)
     attribution_data = {
         "prefix_id": prefix_id,
-        "span_mode": "full",
-        "store_all": store_all,
+        "aggregation": "full_continuation_mean",
         "n_continuations": n_continuations,
         "n_prefix_sources": prefix_ctx.n_prefix_sources,
         "n_prefix_features": prefix_ctx.n_prefix_features,
         "continuation_metadata": continuation_metadata,
-        "span_info": span_info,
-        "aggregated_attributions_pooling": "sum",
     }
 
     attribution_file = output_dir / f"{prefix_id}_attribution.json"
@@ -280,20 +250,9 @@ def main():
         help="Output directory (default: results/3_attribution_graphs/)"
     )
     parser.add_argument(
-        "--store-all",
-        action="store_true",
-        help="Store all token-level attributions (defer aggregation to Stage 5)"
-    )
-    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Quiet mode (only progress bars)"
-    )
-    parser.add_argument(
-        "--backend",
-        choices=["auto", "transformerlens", "nnsight"],
-        default="auto",
-        help="ReplacementModel backend. 'auto' picks nnsight for Gemma3 models.",
     )
     args = parser.parse_args()
 
@@ -302,7 +261,7 @@ def main():
     paths.ensure_dirs()
 
     if args.output_dir is None:
-        args.output_dir = paths.results / "3_attribution_graphs"
+        args.output_dir = paths.results_attribution_graphs
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     # Setup logger
@@ -310,7 +269,7 @@ def main():
     log_level = logging.WARNING if args.quiet else logging.INFO
     logger = setup_logger(
         "continuation_attribution",
-        log_file=args.output_dir / "compute_continuation_attribution.log",
+        log_file=paths.logs / "compute_continuation_attribution.log",
         level=log_level
     )
 
@@ -322,7 +281,6 @@ def main():
     logger.info(f"Transcoder: {args.transcoder}")
     logger.info(f"Dtype: {args.dtype}")
     logger.info("Span mode: full")
-    logger.info(f"Store all: {args.store_all}")
     logger.info(f"Max feature nodes: {args.max_feature_nodes}")
     logger.info(f"Batch size: {args.batch_size}")
     logger.info(f"Output dir: {args.output_dir}")
@@ -335,11 +293,6 @@ def main():
 
     branches_index = load_json(branches_index_file)
     logger.info(f"Loaded branches index: {len(branches_index['output_files'])} prefixes")
-
-    # Filter by Stage 2 manifest
-    # Derive results_dir from branches_dir to respect --output-dir
-    # branches_dir is typically {output_dir}/results/2_branch_sampling/
-    results_dir = args.branches_dir.parent
     all_prefix_ids = []
     branches_files = {}
 
@@ -371,10 +324,8 @@ def main():
 
         branches_files[prefix_id] = resolved
 
-    available_ids, skipped_ids = filter_samples_by_manifest(
-        all_prefix_ids, results_dir, "stage2", logger
-    )
-    logger.info(f"Processing {len(available_ids)} prefixes (skipped {len(skipped_ids)})")
+    available_ids = all_prefix_ids
+    logger.info(f"Processing {len(available_ids)} prefixes")
 
     # Initialize ReplacementModel
     logger.info("\nInitializing ReplacementModel...")
@@ -385,17 +336,8 @@ def main():
         "bfloat16": torch.bfloat16,
     }
     model_dtype = dtype_map[args.dtype]
-
-    backend = resolve_backend(args.model, args.backend)
-    logger.info("Using backend=%s for model=%s", backend, args.model)
-
-    model = ReplacementModel.from_pretrained(
-        args.model,
-        args.transcoder,
-        backend=backend,
-        dtype=model_dtype,
-    )
-    logger.info("ReplacementModel initialized (backend=%s)", backend)
+    model = ReplacementModel.from_pretrained(args.model, args.transcoder, dtype=model_dtype)
+    logger.info("ReplacementModel initialized")
 
     # Process each prefix
     logger.info("\n" + "=" * 60)
@@ -424,7 +366,6 @@ def main():
                 args.batch_size,
                 args.output_dir,
                 logger,
-                store_all=args.store_all,
             )
             completed_ids.append(prefix_id)
         except Exception as e:
@@ -439,8 +380,7 @@ def main():
     index_data = {
         "model": args.model,
         "transcoder": args.transcoder,
-        "span_mode": "full",
-        "store_all": args.store_all,
+        "aggregation": "full_continuation_mean",
         "max_feature_nodes": args.max_feature_nodes,
         "n_prefixes_processed": len(completed_ids),
         "prefixes": completed_ids,
@@ -449,22 +389,11 @@ def main():
     index_file = args.output_dir / "attribution_index.json"
     save_json(index_data, index_file)
 
-    # Write Stage 3 manifest
-    update_manifest_with_results(
-        results_dir=results_dir,
-        stage_name="stage3",
-        processed=completed_ids,
-        failed=failed_ids,
-        skipped=skipped_ids,
-        logger=logger,
-        errors=errors,
-    )
-
     logger.info("=" * 60)
     logger.info("COMPLETE")
     logger.info("=" * 60)
     logger.info(f"Processed {len(completed_ids)}/{len(available_ids)} prefixes")
-    logger.info(f"Completed: {len(completed_ids)}, Failed: {len(failed_ids)}, Skipped: {len(skipped_ids)}")
+    logger.info(f"Completed: {len(completed_ids)}, Failed: {len(failed_ids)}")
     logger.info(f"Output directory: {args.output_dir}")
     logger.info(f"Index file: {index_file}")
 

@@ -35,10 +35,8 @@ CIRCUIT_TRACER_PATH = Path(__file__).resolve().parents[1] / "circuit-tracer"
 sys.path.insert(0, str(CIRCUIT_TRACER_PATH))
 
 from utils.data_utils import load_json, save_json
-from utils.attribution_pooling import load_pooled_attributions
 from utils.logging_utils import setup_logger, get_log_path
 from utils.memory_utils import clear_memory
-from utils.model_backend import get_model_device, resolve_backend, resolve_stage_backend
 from circuit_tracer import ReplacementModel
 
 # Import from refactored modules
@@ -57,11 +55,9 @@ steering = _import_module("7c_steering", _module_dir / "7c_steering.py")
 metrics = _import_module("7c_metrics", _module_dir / "7c_metrics.py")
 utils = _import_module("7c_utils", _module_dir / "7c_utils.py")
 hypotheses = _import_module("7c_hypotheses", _module_dir / "7c_hypotheses.py")
-prefix_sharding = _import_module("stage7_prefix_sharding", _module_dir / "stage7_prefix_sharding.py")
 
 # Import the combined medoid H_c function from 7c_graph
 compute_semantic_graphs_combined_medoid = graph.compute_semantic_graphs_combined_medoid
-select_prefix_shard = prefix_sharding.select_prefix_shard
 
 
 # =============================================================================
@@ -183,7 +179,6 @@ def load_prefix_data_for_combined_medoid_baseline(
     samples_dir: Path,
     embeddings_dir: Path,
     logger,
-    pooling: str = "mean",
 ) -> Dict[str, Any]:
     """Load data needed for combined-distance medoid baseline.
     
@@ -211,12 +206,10 @@ def load_prefix_data_for_combined_medoid_baseline(
     
     # Load attribution context
     prefix_context_file = attribution_graphs_dir / f"{prefix_id}_prefix_context.pt"
-    pooled_attributions = load_pooled_attributions(
-        prefix_context_file,
-        pooling=pooling,
-        meta_file=attribution_graphs_dir / f"{prefix_id}_attribution.json",
-    )
-    aggregated_attributions = pooled_attributions.values
+    context_data = torch.load(prefix_context_file, weights_only=False)
+    
+    # Get aggregated attributions (raw, uncentered)
+    aggregated_attributions = context_data["aggregated_attributions"].float().numpy()
     
     # Load embeddings
     embeddings_file = embeddings_dir / f"{prefix_id}_embeddings.npy"
@@ -265,15 +258,8 @@ def main():
                         help="Maximum samples per cluster")
     parser.add_argument("--max-batch-size", type=int, default=None,
                         help="Maximum batch size for steering")
-    parser.add_argument("--pooling", type=str, default=None,
-                        choices=["mean", "max", "sum"],
-                        help="Pooling method for attributions")
     parser.add_argument("--prefix-id", type=str, default=None,
                         help="Process only a specific prefix")
-    parser.add_argument("--prefix-shard-index", type=int, default=0,
-                        help="0-based deterministic prefix shard index to process")
-    parser.add_argument("--prefix-shard-count", type=int, default=1,
-                        help="Total number of deterministic prefix shards")
     parser.add_argument("--cross-prefix-batching", action="store_true",
                         help="Enable cross-prefix batching")
     parser.add_argument("--prefix-batch-size", type=int, default=None,
@@ -310,7 +296,6 @@ def main():
     # Load config
     config = {}
     sweeps = []
-    steering_config = {}
     if args.config and args.config.exists():
         with open(args.config) as f:
             config = json.load(f)
@@ -330,8 +315,6 @@ def main():
         # Update args from config
         if args.max_cluster_samples is None:
             args.max_cluster_samples = steering_config.get("max_cluster_samples", 20)
-        if args.max_samples is None:
-            args.max_samples = steering_config.get("max_samples", None)
         if args.max_batch_size is None:
             args.max_batch_size = steering_config.get("max_batch_size", 512)
         if not args.cross_prefix_batching:
@@ -340,8 +323,6 @@ def main():
             args.prefix_batch_size = steering_config.get("prefix_batch_size", 16)
         if args.K_clamp is None:
             args.K_clamp = steering_config.get("K_clamp", None)
-
-    args.pooling = args.pooling or config.get("clustering", {}).get("pooling", "mean") or "mean"
     
     if not sweeps:
         # Default sweep
@@ -390,17 +371,6 @@ def main():
     
     if args.prefix_id:
         prefix_ids = [args.prefix_id]
-
-    prefixes_before_shard = len(prefix_ids)
-    prefix_ids = select_prefix_shard(
-        prefix_ids,
-        shard_index=args.prefix_shard_index,
-        shard_count=args.prefix_shard_count,
-    )
-    logger.info(
-        f"Prefix shard index {args.prefix_shard_index} of {args.prefix_shard_count}: "
-        f"selected {len(prefix_ids)}/{prefixes_before_shard} prefixes"
-    )
     
     if args.max_samples and len(prefix_ids) > args.max_samples:
         prefix_ids = prefix_ids[:args.max_samples]
@@ -413,7 +383,7 @@ def main():
     
     # Setup output directory
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    h4a_output_dir = args.output_dir / "H4a_combined_medoid"
+    h4a_output_dir = args.output_dir / "rd"
     h4a_output_dir.mkdir(parents=True, exist_ok=True)
     
     if args.skip_existing:
@@ -440,26 +410,17 @@ def main():
     logger.info("Loading model...")
     global_config = config.get("global", {})
     max_seq_len = global_config.get("max_seq_len", 64)
-    store_sequence_logit_values = bool(steering_config.get("store_sequence_logit_values", False))
     
     model_config = config.get("model", {})
     model_name = model_config.get("base_model", args.model)
     transcoder_name = model_config.get("transcoder", args.transcoder)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    backend_arg = resolve_stage_backend(config, "stage_7c_steering")
-    backend = resolve_backend(model_name, backend_arg)
-    logger.info("Using Stage 7c backend=%s for model=%s", backend, model_name)
     model = ReplacementModel.from_pretrained(
-        model_name,
-        transcoder_name,
-        backend=backend,
-        device=device,
-        dtype=torch.bfloat16,
-        lazy_encoder=True,
-        lazy_decoder=False,
+        model_name, transcoder_name, device=device, dtype=torch.bfloat16,
+        lazy_encoder=True, lazy_decoder=False
     )
-    device = get_model_device(model, fallback=device)
+    device = model.cfg.device
     
     # Build max_top_B from sweeps
     max_top_B = max(max(sw.get("top_B", [10])) for sw in sweeps)
@@ -499,7 +460,6 @@ def main():
                     args.samples_dir,
                     args.embeddings_dir,
                     logger,
-                    pooling=args.pooling,
                 )
             except Exception as e:
                 logger.error(f"Error loading data for {prefix_id}: {e}")
@@ -566,9 +526,7 @@ def main():
             
             baseline_branch_log_probs = steering.compute_branch_log_probs_batch(
                 model, baseline_branches, logger,
-                batch_size=args.max_batch_size,
-                max_seq_len=max_seq_len,
-                store_per_token=store_sequence_logit_values,
+                batch_size=args.max_batch_size, max_seq_len=max_seq_len
             )
             baseline_metadata = steering.compute_baseline_metadata(
                 baseline_branches, baseline_branch_log_probs
@@ -577,7 +535,7 @@ def main():
             # Initialize prefix results
             prefix_results = {
                 "prefix_id": prefix_id,
-                "baseline_method": "combined_medoid",
+                "method": "rd",
                 "use_weights": args.use_weights,
                 "feature_selection": "magnitude",
                 "clustering_runs": {}
@@ -745,7 +703,6 @@ def main():
                             log_details=False,
                             max_batch_size=args.max_batch_size,
                             max_seq_len=max_seq_len,
-                            store_sequence_logit_values=store_sequence_logit_values,
                             logger=logger,
                         )
                         for ctx in ctx_list:
@@ -773,7 +730,6 @@ def main():
                                 max_batch_size=args.max_batch_size,
                                 cross_prefix_batching=False,
                                 max_seq_len=max_seq_len,
-                                store_sequence_logit_values=store_sequence_logit_values,
                                 logger=logger,
                             )
                             batch_prefix_state[p_id]["prefix_results"]["clustering_runs"][ck]["results"][key] = result
@@ -789,9 +745,13 @@ def main():
         
         # Save results
         for prefix_id, state in batch_prefix_state.items():
-            output_file = h4a_output_dir / f"{prefix_id}_sweep_results.json"
-            save_json(state["prefix_results"], output_file)
-            logger.info(f"  Saved {prefix_id} results to {output_file}")
+            hypotheses._save_hypothesis_outputs(
+                state["prefix_results"],
+                ["H4A"],
+                args.output_dir,
+                {"H4A": "rd"},
+            )
+            logger.info(f"  Saved {prefix_id} results to {h4a_output_dir / f'{prefix_id}_sweep_results.json'}")
         
         gc.collect()
         if torch.cuda.is_available():

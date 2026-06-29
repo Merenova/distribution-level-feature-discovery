@@ -281,6 +281,26 @@ def compute_correlation_and_r2(
     return float(corr), float(r2)
 
 
+def compute_all_correlations(
+    x: np.ndarray,
+    y: np.ndarray
+) -> Tuple[float, float, float]:
+    """Compute Pearson correlation, R², and Spearman correlation.
+
+    Convenience function that returns all correlation metrics at once.
+
+    Args:
+        x: Independent variable array (e.g., epsilon values)
+        y: Dependent variable array (e.g., mean effects)
+
+    Returns:
+        (pearson_corr, r_squared, spearman_corr) tuple.
+    """
+    pearson, r2 = compute_correlation_and_r2(x, y)
+    spearman = compute_spearman_correlation(x, y)
+    return pearson, r2, spearman
+
+
 # =============================================================================
 # Batch Processing Utilities (Phase 2)
 # =============================================================================
@@ -363,16 +383,14 @@ def get_encoder_weights(
         >>> W_enc.shape  # doctest: +SKIP
         torch.Size([3, d_model])
     """
-    transcoders = getattr(model.transcoders, "_module", model.transcoders)
-
-    if hasattr(transcoders, "transcoders"):
+    if hasattr(model.transcoders, "transcoders"):
         # TranscoderSet (Single Layer Transcoders)
-        W_enc_full = transcoders[layer].W_enc
-        b_enc_subset = transcoders[layer].b_enc[feat_ids_tensor]
+        W_enc_full = model.transcoders[layer].W_enc
+        b_enc_subset = model.transcoders[layer].b_enc[feat_ids_tensor]
     else:
         # CrossLayerTranscoder
-        W_enc_full = transcoders._get_encoder_weights(layer)
-        b_enc_subset = transcoders.b_enc[layer][feat_ids_tensor]
+        W_enc_full = model.transcoders._get_encoder_weights(layer)
+        b_enc_subset = model.transcoders.b_enc[layer][feat_ids_tensor]
 
     W_enc_subset = W_enc_full[feat_ids_tensor]
 

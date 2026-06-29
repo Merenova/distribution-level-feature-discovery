@@ -36,10 +36,8 @@ CIRCUIT_TRACER_PATH = Path(__file__).resolve().parents[1] / "circuit-tracer"
 sys.path.insert(0, str(CIRCUIT_TRACER_PATH))
 
 from utils.data_utils import load_json, save_json
-from utils.attribution_pooling import load_pooled_attributions
 from utils.logging_utils import setup_logger, get_log_path
 from utils.memory_utils import clear_memory
-from utils.model_backend import get_model_device, resolve_backend, resolve_stage_backend
 from circuit_tracer import ReplacementModel
 
 # Import from refactored modules
@@ -58,85 +56,14 @@ steering = _import_module("7c_steering", _module_dir / "7c_steering.py")
 metrics = _import_module("7c_metrics", _module_dir / "7c_metrics.py")
 utils = _import_module("7c_utils", _module_dir / "7c_utils.py")
 hypotheses = _import_module("7c_hypotheses", _module_dir / "7c_hypotheses.py")
-prefix_sharding = _import_module("stage7_prefix_sharding", _module_dir / "stage7_prefix_sharding.py")
 
 # Import the medoid function from 7c_graph
 compute_semantic_graphs_medoid = graph.compute_semantic_graphs_medoid
-select_prefix_shard = prefix_sharding.select_prefix_shard
 
 
 # =============================================================================
 # K-means Clustering Functions
 # =============================================================================
-
-def _resolve_pooling(cli_pooling: Optional[str], config: Dict[str, Any]) -> str:
-    """Resolve attribution pooling with CLI taking precedence over config."""
-    return cli_pooling or config.get("clustering", {}).get("pooling", "mean") or "mean"
-
-
-def validate_kmeans_k(
-    raw_k: Any,
-    n_samples: int,
-    k_clamp: Optional[int] = None,
-) -> Tuple[Optional[int], Optional[str]]:
-    """Validate K for sklearn KMeans.
-
-    Returns (valid_k, None) when K is usable, otherwise (None, stable_reason).
-    """
-    if raw_k is None:
-        return None, "invalid_k_missing"
-
-    if isinstance(raw_k, (bool, np.bool_)):
-        return None, "invalid_k_not_integer"
-
-    if isinstance(raw_k, (int, np.integer)):
-        K = int(raw_k)
-    elif isinstance(raw_k, (float, np.floating)):
-        if not np.isfinite(raw_k) or not float(raw_k).is_integer():
-            return None, "invalid_k_not_integer"
-        K = int(raw_k)
-    elif isinstance(raw_k, str):
-        try:
-            numeric_k = float(raw_k)
-        except ValueError:
-            return None, "invalid_k_not_integer"
-        if not np.isfinite(numeric_k) or not numeric_k.is_integer():
-            return None, "invalid_k_not_integer"
-        K = int(numeric_k)
-    else:
-        return None, "invalid_k_not_integer"
-
-    if K < 2:
-        return None, "invalid_k_less_than_2"
-
-    if k_clamp is not None and K > int(k_clamp):
-        return None, "invalid_k_above_clamp"
-
-    if K > int(n_samples):
-        return None, "invalid_k_above_samples"
-
-    return K, None
-
-
-def record_skipped_kmeans_config(
-    prefix_results: Dict[str, Any],
-    clustering_key: str,
-    raw_k: Any,
-    reason: str,
-    n_samples: int,
-    k_clamp: Optional[int],
-) -> None:
-    """Record a skipped KMeans clustering config in prefix_results."""
-    prefix_results.setdefault("clustering_runs", {})[clustering_key] = {
-        "skipped": True,
-        "skip_reason": reason,
-        "K": raw_k,
-        "n_samples": int(n_samples),
-        "K_clamp": int(k_clamp) if k_clamp is not None else None,
-        "results": {},
-        "timing": {},
-    }
-
 
 def run_kmeans_clustering(
     embeddings: np.ndarray,
@@ -155,12 +82,8 @@ def run_kmeans_clustering(
         - assignments: [n_samples] cluster assignment for each sample
         - cluster_centers: [K, d_embedding] cluster centers
     """
-    valid_K, invalid_reason = validate_kmeans_k(K, len(embeddings))
-    if invalid_reason is not None:
-        raise ValueError(invalid_reason)
-
     kmeans = KMeans(
-        n_clusters=valid_K,
+        n_clusters=K,
         init='k-means++',
         n_init=10,
         max_iter=300,
@@ -321,7 +244,6 @@ def load_prefix_data_for_baseline(
     attribution_graphs_dir: Path,
     samples_dir: Path,
     logger,
-    pooling: str = "mean",
     use_median_center: bool = True,
 ) -> Dict[str, Any]:
     """Load all data needed for K-means baseline.
@@ -345,13 +267,11 @@ def load_prefix_data_for_baseline(
     embeddings_file = embeddings_dir / f"{prefix_id}_embeddings.npy"
     embeddings = np.load(embeddings_file)
     
+    # Load attribution context
     prefix_context_file = attribution_graphs_dir / f"{prefix_id}_prefix_context.pt"
-    pooled_attributions = load_pooled_attributions(
-        prefix_context_file,
-        pooling=pooling,
-        meta_file=attribution_graphs_dir / f"{prefix_id}_attribution.json",
-    )
-    attributions = pooled_attributions.values
+    context_data = torch.load(prefix_context_file, weights_only=False)
+    
+    attributions = context_data["aggregated_attributions"].float().numpy()
     
     # Compute H_0 (shared attribution center) consistent with distortion choice.
     # IMPORTANT: If you use L1-style centers (weighted median) for H_c, you should also
@@ -473,70 +393,6 @@ def build_semantic_graphs_from_kmeans_medoid(
 # and normal batching modes with all metric computation
 
 
-def _save_kmeans_hypothesis_outputs(
-    prefix_results: Dict[str, Any],
-    hypotheses_to_run: List[str],
-    output_dir: Path,
-    hypothesis_dirs: Dict[str, str],
-) -> None:
-    """Save kmeans outputs while preserving skipped K metadata."""
-    prefix_id = prefix_results.get("prefix_id")
-    clustering_runs = prefix_results.get("clustering_runs", {})
-
-    for hypothesis in hypotheses_to_run:
-        folder_name = hypothesis_dirs.get(hypothesis, hypothesis)
-        hypothesis_dir = output_dir / folder_name
-        hypothesis_dir.mkdir(parents=True, exist_ok=True)
-
-        per_prefix = {
-            "prefix_id": prefix_id,
-            "feature_selection": prefix_results.get("feature_selection"),
-            "clustering_runs": {}
-        }
-
-        for clustering_key, run in clustering_runs.items():
-            if run.get("skipped"):
-                per_prefix["clustering_runs"][clustering_key] = {
-                    "skipped": True,
-                    "skip_reason": run.get("skip_reason"),
-                    "K": run.get("K"),
-                    "n_samples": run.get("n_samples"),
-                    "K_clamp": run.get("K_clamp"),
-                    "results": run.get("results", {}),
-                    "timing": run.get("timing", {}),
-                }
-                continue
-
-            entry = {
-                "beta": run.get("beta"),
-                "gamma": run.get("gamma"),
-                "n_clusters": run.get("n_clusters"),
-                "n_branches": run.get("n_branches"),
-            }
-            if "timing" in run:
-                entry["timing"] = run["timing"]
-
-            if hypothesis == "H4A":
-                entry["results"] = run.get("results", {})
-            elif hypothesis == "H4A_GEN":
-                if "H4a_generation" not in run:
-                    continue
-                entry["H4a_generation"] = run["H4a_generation"]
-            elif hypothesis == "H4C":
-                if "H4c_specificity" not in run:
-                    continue
-                entry["H4c_specificity"] = run["H4c_specificity"]
-            elif hypothesis == "H4C_MASS":
-                if "H4c_cluster_mass_pairwise" not in run:
-                    continue
-                entry["H4c_cluster_mass_pairwise"] = run["H4c_cluster_mass_pairwise"]
-
-            per_prefix["clustering_runs"][clustering_key] = entry
-
-        if per_prefix["clustering_runs"]:
-            save_json(per_prefix, hypothesis_dir / f"{prefix_id}_sweep_results.json")
-
-
 # =============================================================================
 # Main Entry Point
 # =============================================================================
@@ -565,19 +421,12 @@ def main():
                         help="Maximum samples per cluster")
     parser.add_argument("--max-batch-size", type=int, default=None,
                         help="Maximum batch size for steering")
-    parser.add_argument("--pooling", type=str, default=None,
-                        choices=["mean", "max", "sum"],
-                        help="Pooling method for attributions")
     parser.add_argument("--use-mean", action="store_true",
                         help="Use weighted mean instead of median for H_c")
     parser.add_argument("--use-medoid", action="store_true",
                         help="Use L1-medoid instead of weighted median for H_c (stays on manifold)")
     parser.add_argument("--prefix-id", type=str, default=None,
                         help="Process only a specific prefix")
-    parser.add_argument("--prefix-shard-index", type=int, default=0,
-                        help="0-based deterministic prefix shard index to process")
-    parser.add_argument("--prefix-shard-count", type=int, default=1,
-                        help="Total number of deterministic prefix shards")
     parser.add_argument("--cross-prefix-batching", action="store_true",
                         help="Enable cross-prefix batching")
     parser.add_argument("--prefix-batch-size", type=int, default=None,
@@ -632,8 +481,6 @@ def main():
         # Update args from config
         if args.max_cluster_samples is None:
             args.max_cluster_samples = steering_config.get("max_cluster_samples", 20)
-        if args.max_samples is None:
-            args.max_samples = steering_config.get("max_samples", None)
         if args.max_batch_size is None:
             args.max_batch_size = steering_config.get("max_batch_size", 512)
         if not args.cross_prefix_batching:
@@ -643,8 +490,6 @@ def main():
         # K_clamp from config if not provided via CLI
         if args.K_clamp is None:
             args.K_clamp = steering_config.get("K_clamp", None)
-
-    args.pooling = _resolve_pooling(args.pooling, config)
     
     if not sweeps:
         # Default sweep
@@ -663,22 +508,14 @@ def main():
     if args.prefix_batch_size is None or args.prefix_batch_size <= 0:
         args.prefix_batch_size = 16
 
-    if args.hypotheses is not None:
-        hypotheses_to_run = [h.upper() for h in args.hypotheses]
-    elif "hypotheses" in steering_config:
-        hypotheses_to_run = [h.upper() for h in steering_config["hypotheses"]]
-    else:
-        hypotheses_to_run = ["H4A"]
-    run_h4a_sweeps = "H4A" in hypotheses_to_run
-    run_h4c = "H4C" in hypotheses_to_run
-    run_h4c_mass = "H4C_MASS" in hypotheses_to_run
-
-    if run_h4c_mass and not args.use_medoid:
-        raise ValueError("H4C_MASS on the K-means baseline requires --use-medoid")
+    hypotheses_to_run = ["H4A"]
+    run_h4a_sweeps = True
+    run_h4c = False
+    run_h4c_mass = False
 
     feature_selection = args.feature_selection or steering_config.get("feature_selection", "magnitude")
     primary_sweep_settings = hypotheses._resolve_primary_sweep_settings(sweeps, steering_config)
-    hypothesis_dirs = {"H4A": "H4a", "H4C": "H4c", "H4C_MASS": "H4c_mass"}
+    hypothesis_dirs = {"H4A": "km_sem"}
     manifest_by_prefix = None
     manifest_prefix_order = None
     if args.clustering_manifest:
@@ -693,29 +530,13 @@ def main():
     # Find prefixes
     embedding_files = sorted(args.embeddings_dir.glob("*_embeddings.npy"))
     prefix_ids = [f.stem.replace("_embeddings", "") for f in embedding_files]
-
-    if manifest_prefix_order is not None and not args.prefix_id:
-        discovered_prefixes = set(prefix_ids)
-        prefix_ids = [pid for pid in manifest_prefix_order if pid in discovered_prefixes]
-
+    
     if args.prefix_id:
         prefix_ids = [args.prefix_id]
-
-    prefixes_before_shard = len(prefix_ids)
-    prefix_ids = select_prefix_shard(
-        prefix_ids,
-        shard_index=args.prefix_shard_index,
-        shard_count=args.prefix_shard_count,
-    )
-    logger.info(
-        f"Prefix shard index {args.prefix_shard_index} of {args.prefix_shard_count}: "
-        f"selected {len(prefix_ids)}/{prefixes_before_shard} prefixes"
-    )
-
+    
     if args.max_samples and len(prefix_ids) > args.max_samples:
         prefix_ids = prefix_ids[:args.max_samples]
-        logger.info(f"Limited to first {args.max_samples} prefixes after sharding")
-
+    
     logger.info(f"Processing {len(prefix_ids)} prefixes")
     if args.beta_values:
         logger.info(f"Filtering to beta values: {args.beta_values}")
@@ -724,6 +545,10 @@ def main():
     if args.clustering_manifest:
         logger.info(f"Using clustering manifest: {args.clustering_manifest}")
     logger.info(f"Hypotheses: {hypotheses_to_run}, feature_selection={feature_selection}")
+
+    if manifest_prefix_order is not None and not args.prefix_id:
+        discovered_prefixes = set(prefix_ids)
+        prefix_ids = [pid for pid in manifest_prefix_order if pid in discovered_prefixes]
     
     # Setup output directory
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -742,26 +567,17 @@ def main():
     logger.info("Loading model...")
     global_config = config.get("global", {})
     max_seq_len = global_config.get("max_seq_len", 64)
-    store_sequence_logit_values = bool(steering_config.get("store_sequence_logit_values", False))
     
     model_config = config.get("model", {})
     model_name = model_config.get("base_model", args.model)
     transcoder_name = model_config.get("transcoder", args.transcoder)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    backend_arg = resolve_stage_backend(config, "stage_7c_steering")
-    backend = resolve_backend(model_name, backend_arg)
-    logger.info("Using Stage 7c backend=%s for model=%s", backend, model_name)
     model = ReplacementModel.from_pretrained(
-        model_name,
-        transcoder_name,
-        backend=backend,
-        device=device,
-        dtype=torch.bfloat16,
-        lazy_encoder=True,
-        lazy_decoder=False,
+        model_name, transcoder_name, device=device, dtype=torch.bfloat16,
+        lazy_encoder=True, lazy_decoder=False
     )
-    device = get_model_device(model, fallback=device)
+    device = model.cfg.device
     
     # Build max_top_B from sweeps
     max_top_B = max(max(sw.get("top_B", [10])) for sw in sweeps)
@@ -796,7 +612,6 @@ def main():
                     args.attribution_graphs_dir,
                     args.samples_dir,
                     logger,
-                        pooling=args.pooling,
                         use_median_center=not args.use_mean,
                 )
             except Exception as e:
@@ -811,17 +626,6 @@ def main():
             
             # Load RD sweep K values (baseline uses RD only to choose K and optionally filter by K_clamp)
             K_map, K_clamp_from_sweep = load_rd_sweep_K_values(clustering_file)
-            # Use K_clamp if provided via CLI, otherwise use sweep_config K_clamp
-            effective_K_clamp = args.K_clamp if args.K_clamp is not None else K_clamp_from_sweep
-
-            # Initialize prefix results before warm-start so invalid configs can be recorded.
-            prefix_results = {
-                "prefix_id": prefix_id,
-                "baseline_method": "kmeans_medoid" if args.use_medoid else "kmeans",
-                "feature_selection": feature_selection,
-                "clustering_runs": {}
-            }
-
             if manifest_by_prefix is not None:
                 prefix_manifest_entries = manifest_by_prefix.get(prefix_id, [])
                 if not prefix_manifest_entries:
@@ -837,42 +641,9 @@ def main():
                         missing_keys.append(key)
                         continue
                     expected_k = manifest_entry.get("K")
-                    if expected_k is not None:
-                        expected_valid_K, expected_invalid_reason = validate_kmeans_k(
-                            expected_k,
-                            prefix_data["n_samples"],
-                            effective_K_clamp,
-                        )
-                        if expected_invalid_reason is not None:
-                            record_skipped_kmeans_config(
-                                prefix_results,
-                                key,
-                                expected_k,
-                                expected_invalid_reason,
-                                prefix_data["n_samples"],
-                                effective_K_clamp,
-                            )
-                            continue
-
-                        actual_valid_K, actual_invalid_reason = validate_kmeans_k(
-                            actual_k,
-                            prefix_data["n_samples"],
-                            effective_K_clamp,
-                        )
-                        if actual_invalid_reason is not None:
-                            record_skipped_kmeans_config(
-                                prefix_results,
-                                key,
-                                actual_k,
-                                actual_invalid_reason,
-                                prefix_data["n_samples"],
-                                effective_K_clamp,
-                            )
-                            continue
-
-                        if actual_valid_K != expected_valid_K:
-                            mismatched_k.append((key, expected_k, actual_k))
-                            continue
+                    if expected_k is not None and int(actual_k) != int(expected_k):
+                        mismatched_k.append((key, expected_k, actual_k))
+                        continue
                     allowed_keys.append(key)
                 if missing_keys:
                     logger.warning(
@@ -889,6 +660,9 @@ def main():
                     f"requested configs for {prefix_id}"
                 )
                 K_map = {key: K_map[key] for key in allowed_keys}
+            
+            # Use K_clamp if provided via CLI, otherwise use sweep_config K_clamp
+            effective_K_clamp = args.K_clamp if args.K_clamp is not None else K_clamp_from_sweep
 
             # IMPORTANT: Do NOT reuse RD clustering's H_0 here.
             # Baseline centers using its own L1-consistent H_0 (weighted median) from attributions + path_probs.
@@ -897,57 +671,15 @@ def main():
             # Compute baseline log_P
             logger.info(f"  {prefix_id}: Computing baseline log_P...")
             # Pick a valid K for the baseline warm-start; skip prefixes with only invalid Ks
-            valid_Ks = []
-            for clustering_key, raw_k in K_map.items():
-                valid_K, invalid_reason = validate_kmeans_k(
-                    raw_k,
-                    prefix_data["n_samples"],
-                    effective_K_clamp,
-                )
-                if invalid_reason is not None:
-                    record_skipped_kmeans_config(
-                        prefix_results,
-                        clustering_key,
-                        raw_k,
-                        invalid_reason,
-                        prefix_data["n_samples"],
-                        effective_K_clamp,
-                    )
-                    logger.warning(
-                        f"  {prefix_id}: Skipping {clustering_key} with K={raw_k}: {invalid_reason}"
-                    )
-                    continue
-                valid_Ks.append(valid_K)
-
+            valid_Ks = [k for k in K_map.values() if k is not None and k > 1 and k <= effective_K_clamp]
             if not valid_Ks:
-                if not K_map and not prefix_results["clustering_runs"]:
+                if not K_map:
                     # Fallback when sweep data is missing: use min(5, K_clamp) to respect K_clamp
-                    fallback_clamp = int(effective_K_clamp) if effective_K_clamp is not None else 5
-                    fallback_K = min(5, fallback_clamp) if fallback_clamp > 1 else 2
-                    valid_fallback_K, fallback_reason = validate_kmeans_k(
-                        fallback_K,
-                        prefix_data["n_samples"],
-                        effective_K_clamp,
-                    )
-                    if fallback_reason is not None:
-                        logger.warning(
-                            f"  {prefix_id}: No sweep data and fallback K={fallback_K} is invalid: "
-                            f"{fallback_reason}; skipping baseline"
-                        )
-                        continue
-                    valid_Ks = [valid_fallback_K]
-                    logger.warning(f"  {prefix_id}: No sweep data, using fallback K={valid_fallback_K}")
+                    fallback_K = min(5, effective_K_clamp) if effective_K_clamp > 1 else 2
+                    valid_Ks = [fallback_K]
+                    logger.warning(f"  {prefix_id}: No sweep data, using fallback K={fallback_K}")
                 else:
-                    logger.warning(
-                        f"  {prefix_id}: No valid K for n_samples={prefix_data['n_samples']} "
-                        f"and K_clamp={effective_K_clamp}; saving skipped configs"
-                    )
-                    _save_kmeans_hypothesis_outputs(
-                        prefix_results,
-                        hypotheses_to_run,
-                        args.output_dir,
-                        hypothesis_dirs,
-                    )
+                    logger.warning(f"  {prefix_id}: No valid K (need 1 < K <= K_clamp={effective_K_clamp}); skipping baseline")
                     continue
             first_K = valid_Ks[0]
             temp_assignments = run_kmeans_clustering(prefix_data["embeddings"], first_K)[0]
@@ -957,13 +689,19 @@ def main():
             
             baseline_branch_log_probs = steering.compute_branch_log_probs_batch(
                 model, baseline_branches, logger,
-                batch_size=args.max_batch_size,
-                max_seq_len=max_seq_len,
-                store_per_token=store_sequence_logit_values,
+                batch_size=args.max_batch_size, max_seq_len=max_seq_len
             )
             baseline_metadata = steering.compute_baseline_metadata(
                 baseline_branches, baseline_branch_log_probs
             )
+            
+            # Initialize prefix results
+            prefix_results = {
+                "prefix_id": prefix_id,
+                "method": "km_sem",
+                "feature_selection": feature_selection,
+                "clustering_runs": {}
+            }
             
             batch_prefix_state[prefix_id] = {
                 "prefix_data": prefix_data,
@@ -1015,29 +753,12 @@ def main():
                     continue
                     
                 K = K_map[clustering_key]
-                K_clamp = state.get("K_clamp", 20)
-                prefix_data = state["prefix_data"]
+                K_clamp = int(state.get("K_clamp", 20))
                 
-                valid_K, invalid_reason = validate_kmeans_k(
-                    K,
-                    prefix_data["n_samples"],
-                    K_clamp,
-                )
-                if invalid_reason is not None:
-                    record_skipped_kmeans_config(
-                        state["prefix_results"],
-                        clustering_key,
-                        K,
-                        invalid_reason,
-                        prefix_data["n_samples"],
-                        K_clamp,
-                    )
-                    logger.warning(
-                        f"  {prefix_id}: Skipping {clustering_key} with K={K}: {invalid_reason}"
-                    )
+                if K == 1 or K > K_clamp:
                     continue
-                K = valid_K
                 
+                prefix_data = state["prefix_data"]
                 H_0 = state["H_0"]
                 active_features = state["active_features"]
                 selected_features = state["selected_features"]
@@ -1190,7 +911,6 @@ def main():
                                 log_details=False,
                                 max_batch_size=args.max_batch_size,
                                 max_seq_len=max_seq_len,
-                                store_sequence_logit_values=store_sequence_logit_values,
                                 logger=logger,
                             )
                             for ctx in ctx_list:
@@ -1216,7 +936,6 @@ def main():
                                     max_batch_size=args.max_batch_size,
                                     cross_prefix_batching=False,
                                     max_seq_len=max_seq_len,
-                                    store_sequence_logit_values=store_sequence_logit_values,
                                     logger=logger,
                                 )
                                 batch_prefix_state[p_id]["prefix_results"]["clustering_runs"][clustering_key]["results"][key] = result
@@ -1328,7 +1047,7 @@ def main():
         
         # Save results for all prefixes in batch
         for prefix_id, state in batch_prefix_state.items():
-            _save_kmeans_hypothesis_outputs(
+            hypotheses._save_hypothesis_outputs(
                 state["prefix_results"], hypotheses_to_run, args.output_dir, hypothesis_dirs
             )
             logger.info(f"  Saved {prefix_id} results under {args.output_dir}")
