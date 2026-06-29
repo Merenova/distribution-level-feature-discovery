@@ -1,0 +1,138 @@
+{
+  "experiment_name": "MMLU_Qwen3_8B",
+  "random_seed": 42,
+  "global": {
+    "batch_size": 512,
+    "max_seq_len": 64
+  },
+  "data": {
+    "cloze_dir": "data/mmlu_cais_validation_7subjects",
+    "split": "validation",
+    "raw_cloze_dir": "data/raw_clozes"
+  },
+  "stage_0_preprocess": {
+    "enabled": false,
+    "skip_rule_based": false,
+    "skip_llm": false,
+    "skip_split": false,
+    "llm_model": "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8",
+    "llm_batch_size": 16,
+    "llm_gpu_memory": 0.8,
+    "split_ratio": 0.1,
+    "split_seed": 42
+  },
+  "stage_1_data_prep": {
+    "mode": "question",
+    "n_groups": 209
+  },
+  "model": {
+    "base_model": "Qwen/Qwen3-8B",
+    "transcoder": "mwhanna/qwen3-8b-transcoders",
+    "dtype": "bfloat16",
+    "device": "cuda"
+  },
+  "vllm": {
+    "gpu_memory_utilization": 0.95,
+    "tensor_parallel_size": 1,
+    "max_model_len": 256,
+    "trust_remote_code": true
+  },
+  "sampling": {
+    "max_total_continuations": 500,
+    "nucleus_p": 0.9,
+    "temperature": 1.0,
+    "max_tokens": 64,
+    "batch_size": 512,
+    "max_batches": 200,
+    "max_complete": 300
+  },
+  "embedding": {
+    "model_name": "google/embeddinggemma-300m",
+    "method": "contextual_continuation",
+    "batch_size": 32
+  },
+  "attribution": {
+    "max_n_logits": 5000,
+    "desired_logit_prob": 0.9,
+    "batch_size": 2048,
+    "max_feature_nodes": 4096,
+    "offload": "cpu",
+    "span_mode": "full",
+    "store_all": true,
+    "backend": "transformerlens"
+  },
+  "clustering": {
+    "K_max": 30,
+    "K_clamp": 10,
+    "max_iterations": 30,
+    "convergence_threshold": 0.001,
+    "pooling": "mean",
+    "attribution_metric": "l1",
+    "normalize_dims": false,
+    "save_intermediate": false,
+    "skip_existing": true,
+    "sweeps": {
+      "beta_values": [
+        0.5,
+        0.75,
+        1.25,
+        1.5
+      ],
+      "gamma_values": [
+        0.1,
+        0.3,
+        0.5,
+        0.7,
+        0.9
+      ],
+      "n_workers": 32
+    }
+  },
+  "stage_7c_steering": {
+    "enabled": true,
+    "feature_selection": "magnitude",
+    "hypotheses": [
+      "H4a"
+    ],
+    "K_clamp": 10,
+    "max_cluster_samples": 10,
+    "max_samples": null,
+    "log_details": true,
+    "max_batch_size": 256,
+    "cross_prefix_batching": false,
+    "prefix_batch_size": 1,
+    "gen_num_samples_per_epsilon": 5,
+    "gen_max_new_tokens": 50,
+    "gen_temperature": 1.0,
+    "gen_top_k": 50,
+    "gen_top_p": 0.95,
+    "sweeps": [
+      {
+      "name": "sign",
+      "steering_method": "sign",
+      "h_c_selections": [
+        "full"
+      ],
+        "top_B": [
+          5,
+          10
+        ],
+        "epsilon_values": [
+          -1,
+          -0.5,
+          -0.1,
+          0.0,
+          0.1,
+          0.5,
+          1.0
+        ]
+      }
+    ],
+    "backend": "transformerlens"
+  },
+  "paths": {
+    "output_base": "MMLU_Qwen3-8B",
+    "test_results": "test_results",
+    "semantic_graphs": "semantic_graphs"
+  }
+}

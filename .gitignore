@@ -1,0 +1,46 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.python-version
+
+# Editor
+.vscode/
+
+# Holding pen for archived/large result directories
+archive/*
+!archive/7_validation_stage7_legacy/
+!archive/7_validation_stage7_legacy/**
+archive/7_validation_stage7_legacy/**/__pycache__/
+archive/7_validation_stage7_legacy/**/*.py[oc]
+
+# Log files
+*.log
+logs/
+
+# Stage / run outputs (large, regenerable)
+output/
+tmp/
+results/
+figures/
+data/
+paper/
+experiments/
+downstream/
+hypotheses_experiment/
+multiview_comparison/
+analysis/
+full_non_mib_gemma3_family_runs/
+MMLU_Qwen3-4B/
+MMLU_Qwen3-8B/
+MMLU_small4_Qwen3-4B/
+MMLU_small4_Qwen3-8B/
+AmbigQA_Qwen3-4B/
+AmbigQA_Qwen3-8B/
+8_visualization/output/

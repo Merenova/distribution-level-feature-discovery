@@ -1,0 +1,102 @@
+# Reasoning sampling + evaluation config
+# Mirrors the nested style used by configs/Qwen3_8B_config.json.
+
+experiment_name: reasoning_vllm_eval
+random_seed: 42
+
+global:
+  samples_per_example: 128
+  prompt_batch_size: 32
+  max_examples: 100
+  output_root: /tmp/reasoning_runs
+
+models:
+  names:
+    - Qwen/Qwen3-0.6B
+    - Qwen/Qwen3-1.7B
+  dtype: bfloat16
+
+datasets:
+  gsm8k:
+    enabled: true
+    name: openai/gsm8k
+    config: main
+    split: test
+
+  math500:
+    enabled: true
+    name: HuggingFaceH4/MATH-500
+    config: default
+    split: test
+
+vllm:
+  gpu_memory_utilization: 0.9
+  tensor_parallel_size: 1
+  max_model_len: 8192
+  trust_remote_code: true
+
+sampling:
+  temperature: 0.7
+  top_p: 0.95
+  max_tokens: 512
+  logprobs: 1
+
+prompting:
+  gsm8k_final_answer_format: "#### <answer>"
+  math_final_answer_format: "Answer: <answer>"
+
+evaluation:
+  gsm8k:
+    extractor: grade_school_math
+
+  math500:
+    mode: rule_based
+    latex_parser: sympy
+
+reasoning:
+  samples_per_step: 64
+  max_steps: 12
+  step_delimiter: "\n\n"
+  stop_sequences:
+    - "\n\n"
+  top_context_policy: sequence_probability
+  confidence_normalization: per_token_mean
+  attribution_pairs:
+    source_steps: committed_previous
+    include_prompt_source: false
+    masking: zero_non_source_step_features
+  final_answer_markers:
+    gsm8k:
+      - "####"
+    math500:
+      - "\\boxed"
+      - "The answer is"
+
+attribution:
+  backend: transformerlens
+  batch_size: 256
+  max_feature_nodes: 1024
+  store_all: false
+
+embedding:
+  model_name: google/embeddinggemma-300m
+  batch_size: 32
+
+clustering:
+  K_max: 30
+  K_clamp: 10
+  beta: 0.75
+  gamma: 0.7
+  max_iterations: 30
+  convergence_threshold: 0.001
+  pooling: mean
+  attribution_metric: l1
+  normalize_dims: false
+  save_intermediate: false
+  skip_existing: true
+
+external:
+  root_dir: /tmp/reasoning_external
+  auto_clone: true
+  simple_evals_repo: https://github.com/openai/simple-evals.git
+  grade_school_math_repo: https://github.com/openai/grade-school-math.git

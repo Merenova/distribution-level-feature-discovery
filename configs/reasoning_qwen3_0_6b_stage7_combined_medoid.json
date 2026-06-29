@@ -1,0 +1,59 @@
+{
+  "global": {
+    "batch_size": 16,
+    "max_seq_len": null
+  },
+  "model": {
+    "base_model": "Qwen/Qwen3-0.6B",
+    "transcoder": "mwhanna/qwen3-0.6b-transcoders-lowl0",
+    "dtype": "bfloat16",
+    "device": "cuda"
+  },
+  "vllm": {
+    "max_model_len": 256
+  },
+  "clustering": {
+    "K_clamp": 10,
+    "pooling": "mean",
+    "attribution_metric": "l1",
+    "normalize_dims": false,
+    "skip_existing": true
+  },
+  "stage_7c_steering": {
+    "enabled": true,
+    "backend": "transformerlens",
+    "feature_selection": "magnitude",
+    "hypotheses": [
+      "H4a"
+    ],
+    "K_clamp": 10,
+    "max_cluster_samples": 10,
+    "max_samples": null,
+    "log_details": false,
+    "store_sequence_logit_values": false,
+    "max_batch_size": 16,
+    "cross_prefix_batching": false,
+    "prefix_batch_size": 1,
+    "sweeps": [
+      {
+        "name": "sign_full_B5",
+        "steering_method": "sign",
+        "h_c_selections": [
+          "full"
+        ],
+        "top_B": [
+          5
+        ],
+        "epsilon_values": [
+          -1.0,
+          -0.5,
+          -0.1,
+          0.0,
+          0.1,
+          0.5,
+          1.0
+        ]
+      }
+    ]
+  }
+}

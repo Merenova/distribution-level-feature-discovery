@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Distribution-level unsupervised feature discovery for language model continuations using semantic embeddings, mechanistic attributions, and rate-distortion clustering.">
+  <meta name="keywords" content="mechanistic interpretability, circuit analysis, rate-distortion clustering, feature discovery, language models, attribution, activation steering">
+  <meta name="author" content="Hyunjin Cho, Youngji Roh, Jaehyung Kim">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="Yonsei University">
+  <meta property="og:title" content="Shared Semantics, Divergent Mechanisms">
+  <meta property="og:description" content="Unsupervised feature discovery by aligning semantic continuation modes with mechanistic attribution signatures.">
+  <meta property="og:image" content="static/images/rd/method_overview.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Shared Semantics, Divergent Mechanisms">
+  <meta name="twitter:description" content="Distribution-level feature discovery for inspecting language model continuation mechanisms.">
+  <meta name="twitter:image" content="static/images/rd/method_overview.png">
+  <meta name="citation_title" content="Shared Semantics, Divergent Mechanisms: Unsupervised Feature Discovery by Aligning Semantics and Mechanisms">
+  <meta name="citation_author" content="Cho, Hyunjin">
+  <meta name="citation_author" content="Roh, Youngji">
+  <meta name="citation_author" content="Kim, Jaehyung">
+  <meta name="citation_publication_date" content="2026">
+  <meta name="citation_conference_title" content="International Conference on Machine Learning">
+
+  <title>Shared Semantics, Divergent Mechanisms</title>
+  <link rel="icon" type="image/jpeg" href="static/images/wave-particle-duality.jpeg">
+  <link href="https://fonts.googleapis.com/css?family=Google+Sans|Noto+Sans|Castoro" rel="stylesheet">
+  <link rel="stylesheet" href="static/css/bulma.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1/css/academicons.min.css">
+  <link rel="stylesheet" href="static/css/index.css?v=caveats-v1">
+  <script defer src="static/js/fontawesome.all.min.js"></script>
+  <script defer src="static/js/index.js?v=rd-default-cloze-0097-v3"></script>
+</head>
+<body>
+  <button class="scroll-to-top" onclick="scrollToTop()" title="Scroll to top" aria-label="Scroll to top">
+    <i class="fas fa-chevron-up"></i>
+  </button>
+
+  <section class="hero publication-hero">
+    <div class="hero-body">
+      <div class="container is-max-desktop has-text-centered">
+        <h1 class="title is-1 publication-title">Shared Semantics, Divergent Mechanisms</h1>
+        <h2 class="subtitle is-3 publication-subtitle">Unsupervised Feature Discovery<br>by Aligning Semantics and Mechanisms</h2>
+        <div class="is-size-5 publication-authors">
+          <span class="author-block">Hyunjin Cho</span>
+          <span class="author-block">Youngji Roh</span>
+          <span class="author-block">Jaehyung Kim</span>
+        </div>
+        <div class="is-size-5 publication-authors">
+          <span class="author-block">Yonsei University</span><br>
+          <span class="publication-venue">ICML 2026 Spotlight</span>
+        </div>
+        <div class="publication-links">
+          <span class="link-block">
+            <a href="https://arxiv.org/abs/2606.08236" target="_blank" rel="noopener" class="external-link button is-normal is-rounded is-dark">
+              <span class="icon"><i class="fas fa-file-pdf"></i></span>
+              <span>Paper</span>
+            </a>
+          </span>
+          <span class="link-block">
+            <a href="https://github.com/Merenova/distribution-level-feature-discovery" target="_blank" rel="noopener" class="external-link button is-normal is-rounded is-dark">
+              <span class="icon"><i class="fab fa-github"></i></span>
+              <span>Code</span>
+            </a>
+          </span>
+          <span class="link-block">
+            <a href="#BibTeX" class="external-link button is-normal is-rounded is-dark">
+              <span class="icon"><i class="fas fa-quote-right"></i></span>
+              <span>BibTeX</span>
+            </a>
+          </span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section hero is-light" id="abstract">
+    <div class="container is-max-desktop">
+      <h2 class="title is-3 has-text-centered">Abstract</h2>
+      <div class="content paper-copy">
+        <div class="plain-summary">
+          <h3>Lay summary</h3>
+          <p>
+            When an AI model answers a question, there is usually more than one reasonable response it could give. Explaining only one chosen answer can miss these alternatives. Our method looks across many possible responses, groups the ones that mean similar things and seem to come from similar internal signals, and turns them into a short list of answer patterns. This approach helps people choose what to inspect, compare, and test before digging into the model's inner workings.
+          </p>
+        </div>
+        <p>
+          Circuit analysis usually explains one prompt paired with one chosen completion. That can miss variation across the model's continuation distribution. We introduce distribution-level unsupervised feature discovery: cluster sampled continuations using semantic content and sequence-level mechanistic attributions, without specifying target outputs by hand.
+        </p>
+        <p>
+          Each continuation gets a semantic embedding <span class="term-gloss">(a vector representation of what the continuation says)</span> and a prefix-to-continuation attribution signature <span class="term-gloss">(which prefix features pushed the model toward this continuation)</span>. A rate-distortion objective trades off semantic coherence, mechanistic consistency, and cluster granularity. The resulting clusters expose modes that single-view baselines miss and give better targets for steering analyses.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="challenge">
+    <div class="container is-max-desktop">
+      <h2 class="title is-3 has-text-centered">Challenge: One Target Can Hide Many Mechanisms</h2>
+      <div class="triplet-card">
+        <p class="triplet-question"><strong>Q:</strong> <span>Who sings a Khmer version of "You've Got A Friend" in 1973?</span></p>
+        <div class="triplet-answers">
+          <p><strong>A1</strong> "...in 1973 was sung by <b>Sok Sisowath</b>..."</p>
+          <p><strong>A2</strong> "...was performed by <b>Sok Sisowath</b>, a notable Khmer singer..."</p>
+          <p><strong>A3</strong> "...was recorded in 1973 by <b>Srey Mony</b>..."</p>
+        </div>
+        <div class="triplet-contrast">
+          <p><strong>A1 vs A2:</strong> <span class="metric-name">Semantic similarity</span> <span class="metric-value">0.95</span>; <span class="metric-name">Mechanistic distance</span> <span class="metric-value">132</span>. Nearly the same answer, but far apart mechanistically.</p>
+          <p><strong>A2 vs A3:</strong> <span class="metric-name">Semantic similarity</span> <span class="metric-value">0.62</span>; <span class="metric-name">Mechanistic distance</span> <span class="metric-value">87</span>. Different answer, but closer mechanistically.</p>
+        </div>
+      </div>
+      <div class="panel-tabs challenge-panel-tabs">
+        <button class="panel-tab is-active" data-panel-group="challenge" data-panel-target="example" onclick="togglePanel('challenge', 'example')">Example Clusters</button>
+        <button class="panel-tab" data-panel-group="challenge" data-panel-target="summary" onclick="togglePanel('challenge', 'summary')">Silhouette Summary</button>
+      </div>
+      <div class="panel-content is-active" data-panel="challenge" data-panel-name="example">
+        <figure class="figure-block challenge-figure">
+          <img src="static/images/rd/cross_silhouette_kmeans_example_tsne.png" alt="Example comparing clusters found from meaning with clusters found from attribution features" loading="lazy">
+          <figcaption aria-label="View mismatch: one clustering view can look clean while the other collapses.">
+            <span class="caption-lead">View mismatch:</span> one clustering view can look clean while the other collapses.
+            Each dot is a sampled continuation. Colors show K-means clusters found in one view; if those colors mix in the other view, the two views disagree.
+          </figcaption>
+        </figure>
+      </div>
+      <div class="panel-content" data-panel="challenge" data-panel-name="summary">
+        <figure class="figure-block challenge-figure">
+          <img src="static/images/rd/cross_sil_kmeans_only_K2-5.png" alt="Mismatch between semantic and mechanistic clustering views" loading="lazy">
+          <figcaption aria-label="Score interpretation: semantic and mechanistic spaces often disagree, so semantic similarity is not a reliable proxy for circuit similarity.">
+            <span class="caption-lead">Score interpretation:</span> semantic and mechanistic spaces often disagree, so semantic similarity is not a reliable proxy for circuit similarity.
+            Silhouette is a cluster-cleanliness score: higher means same-cluster points stay close and different clusters stay apart. A high native score but low cross-view score means clusters that look clean in one view do not transfer to the other.
+          </figcaption>
+        </figure>
+      </div>
+      <div class="content paper-copy">
+        <p>
+          <span class="metric-name">Semantic similarity</span> compares what two continuations say; higher means they sound more alike. <span class="metric-name">Mechanistic distance</span> compares their attribution signatures; higher means the supporting model features differ more. In the example above, A1 and A2 are semantically close but mechanistically far apart, while A2 and A3 are less semantically similar but mechanistically closer. Semantic similarity alone is not enough: answers that sound alike can use different mechanisms, and different answers can share mechanistic structure. The method asks whether we can find continuation modes that are both readable and mechanistically consistent before choosing targets for circuit analysis.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section hero is-light" id="method">
+    <div class="container is-max-widescreen">
+      <h2 class="title is-3 has-text-centered">Distribution-Level Feature Discovery</h2>
+      <p class="section-lead method-lead">
+        The method works at the distribution level: instead of explaining one chosen answer, it samples many likely continuations for the same prompt, represents each continuation in two ways, and then finds clusters that are coherent in both meaning and mechanism.
+      </p>
+      <figure class="figure-block method-overview-figure">
+        <img src="static/images/rd/method_overview.png" alt="Method overview: continuation sampling, dual representation, and RD clustering" loading="lazy">
+        <figcaption aria-label="Pipeline: the method samples possible answers, represents each answer in two views, and clusters them into auditable modes. The output is a set of auditable continuation modes, not a single target answer.">
+          <span class="caption-lead">Pipeline:</span> the method samples possible answers, represents each answer in two views, and clusters them into auditable modes. The output is a set of auditable continuation modes, not a single target answer.
+        </figcaption>
+      </figure>
+      <div class="method-grid">
+        <article>
+          <h3>1. Sample Continuations</h3>
+          <p>The method samples many likely continuations for one prompt and weights them by model probability.</p>
+        </article>
+        <article>
+          <h3>2. Build Two Views</h3>
+          <p>Semantic embeddings capture what the continuation says. Attribution signatures capture which prefix features support it.</p>
+        </article>
+        <article>
+          <h3>3. Cluster by Rate-Distortion</h3>
+          <p>RD clustering keeps a small set of modes only when they reduce semantic and mechanistic distortion enough to justify the added complexity.</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section class="section cluster-band" id="cluster-dynamics">
+    <div class="container is-max-widescreen">
+      <h2 class="title is-3 has-text-centered">Cluster Dynamics Across Iterations</h2>
+      <p class="section-lead">
+        RD clustering treats each sampled continuation as a <strong>weighted point with two views</strong>: a <strong>semantic embedding</strong> for what it says and an <strong>attribution vector</strong> for the model features that support it. Starting from one cluster, the method alternates between <em>assigning continuations</em> to the cluster that minimizes <strong>entropy-regularized semantic and attribution distortion</strong>, <em>updating cluster centers</em>, and <em>proposing splits</em>. A split is kept only when its <strong>distortion reduction is worth the added rate</strong>, so the number of clusters emerges from the objective rather than being chosen in advance.
+      </p>
+      <div class="rd-trace-widget" data-rd-trace="static/data/rd/traces/cloze_0097_beta_0_50_gamma_0_60/rd_iteration_trace.json">
+        <div class="rd-trace-toolbar" aria-label="RD trace display mode">
+          <button class="panel-tab rd-mode-tab is-active" type="button" data-rd-mode="animation">Animation</button>
+          <button class="panel-tab rd-mode-tab" type="button" data-rd-mode="still">Still</button>
+        </div>
+        <div class="rd-trace-layout">
+          <div class="rd-trace-main">
+            <figure class="figure-block rd-trace-frame-panel is-active">
+              <img class="rd-trace-frame" src="static/images/rd/traces/cloze_0097_beta_0_50_gamma_0_60/rd_iteration_trace_step000_initial.png?v=rd-equal-panels-v9" alt="RD clustering step frame with semantic and mechanistic spaces" loading="lazy">
+              <figcaption aria-label="Iteration view: as clusters split, the same points can become cleaner in both semantic and mechanistic views.">
+                <span class="caption-lead">Iteration view:</span> as clusters split, the same points can become cleaner in both semantic and mechanistic views.
+              </figcaption>
+            </figure>
+            <div class="rd-trace-still-panel" hidden>
+              <div class="rd-trace-controls">
+                <label for="rd-trace-slider">Iteration <span data-rd-iteration-label>Initial</span></label>
+                <input id="rd-trace-slider" class="rd-trace-slider" type="range" min="0" max="6" value="0" step="1">
+                <div class="rd-stage-tabs" aria-label="RD trace stage">
+                  <button class="panel-tab rd-stage-tab is-active" type="button" data-rd-stage="initial">Initial</button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <aside class="rd-trace-metrics" aria-label="RD clustering metrics">
+            <h3>Trace Metrics</h3>
+            <p class="rd-trace-selected" data-rd-selected>Beta 0.50, Gamma 0.60.</p>
+            <div class="rd-metric-row">
+              <span>RD objective</span>
+              <strong data-rd-metric="L_RD">4.929</strong>
+            </div>
+            <div class="rd-metric-row">
+              <span>Semantic distortion</span>
+              <strong data-rd-metric="D_e">0.556</strong>
+            </div>
+            <div class="rd-metric-row">
+              <span>Mechanistic distortion</span>
+              <strong data-rd-metric="D_a">19.158</strong>
+            </div>
+            <div class="rd-metric-row">
+              <span>Weighted distortion</span>
+              <strong data-rd-metric="weighted_distortion">4.929</strong>
+            </div>
+            <div class="rd-metric-row">
+              <span>Rate</span>
+              <strong data-rd-metric="rate">0.000</strong>
+            </div>
+            <div class="rd-metric-row">
+              <span>Clusters</span>
+              <strong data-rd-metric="K">1</strong>
+            </div>
+            <p class="rd-trace-note" data-rd-note>Single-component initialization before EM.</p>
+          </aside>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section causal-band" id="causal-validation">
+    <div class="container is-max-desktop">
+      <h2 class="title is-3 has-text-centered">Causal Validation via Intervention</h2>
+      <div class="content paper-copy steering-source-copy">
+        <p>
+          Steering asks a causal question about a model: <strong>what changes if we deliberately push one internal signal up or down during inference?</strong> In Pearl's language, this is an intervention rather than a correlation check. Instead of only observing that a feature appears with an answer, we change part of the model's internal state and measure the effect. In language models, activation steering does this by <strong>adding, removing, or scaling an internal direction or feature</strong> so the output logits shift.
+        </p>
+        <p>
+          Our cluster intervention applies this idea to answer modes. <strong>Can one cluster-level direction move the model toward a whole answer mode, rather than only one sampled continuation?</strong> For each discovered cluster, we choose a representative source continuation, select the signed top-B attribution features from that source, and scale those features at their original prefix position and layer. We then compare <strong>RD</strong>, which uses the medoid from the joint semantic-and-mechanistic cluster, with <strong>KM-Sem</strong>, a semantic-only K-means medoid, and <strong>Single</strong>, one randomly chosen attribution vector from the same RD cluster. Across steering strengths, a useful cluster direction should show a monotonic target-cluster logit change: amplification raises the cluster's relative preference, and suppression lowers it. In the demonstration below, the star marks the source continuation defining the steering direction.
+        </p>
+      </div>
+      <figure class="figure-block steering-demo-figure">
+        <img src="static/images/steering_demonstration.png" alt="Diagram showing steering direction selection and cluster-level steering validation" loading="lazy">
+        <figcaption aria-label="Steering setup: the selected RD medoid direction provides top-B attribution features for activation steering, then target-logit changes are measured for cluster members.">
+          <span class="caption-lead">Steering setup:</span> the selected RD medoid direction provides top-B attribution features for activation steering, then target-logit changes are measured for cluster members.
+        </figcaption>
+      </figure>
+      <div class="steering-result-layout">
+        <figure class="figure-block steering-result-figure">
+          <img src="static/images/rd/method_comparison_summary.png" alt="Mean Pearson and Spearman steering correlations for RD, KM-Sem, and Single" loading="lazy">
+          <figcaption aria-label="Correlation check: RD shows the clearest monotonic response, while semantic-only clusters are near zero and single-continuation directions are weaker.">
+            <span class="caption-lead">Correlation check:</span> RD shows the clearest monotonic response, while semantic-only clusters are near zero and single-continuation directions are weaker.
+          </figcaption>
+        </figure>
+        <div class="steering-result-summary">
+          <h3>Result</h3>
+          <div class="content paper-copy steering-result-copy">
+            <p>
+              Positive correlation means the intervention behaves directionally: stronger amplification or suppression produces larger target-cluster logit changes. RD medoid directions show the most consistent monotonic response, KM-Sem stays close to zero, and Single transfers only partially from one randomly chosen continuation. <strong>Implication:</strong> KM-Sem's failure suggests that semantic grouping alone does not recover causally useful feature directions, while Single's weaker transfer shows that one continuation can miss the cluster-level mechanism. RD succeeds because its medoid is chosen from a group aligned in both semantic and mechanistic views.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section hero is-light" id="mechanism-examples">
+    <div class="container is-max-widescreen">
+      <h2 class="title is-3 has-text-centered">Cluster-Level Transfer Case Study</h2>
+      <div class="case-study-prompt">
+        <strong>Question:</strong> Who pays for the renovations on <em>Holmes Next Generation</em>?
+      </div>
+      <div class="case-study-grid">
+        <article class="case-study-card">
+          <h3>Mode 1: Production Funding</h3>
+          <p class="case-study-context">Held-out continuations answer that the renovation is funded by the production company or network.</p>
+          <div class="case-study-examples" aria-label="Production funding held-out continuations">
+            <p><strong>A1</strong> "...funded by the production company or network..."</p>
+            <p><strong>A2</strong> "...HNG... funded by the production company..."</p>
+            <p><strong>A3</strong> "...reality TV show... funded by the production company..."</p>
+          </div>
+          <div class="case-study-comparison">
+            <div class="case-study-row is-rd">
+              <div>
+                <span>RD-medoid source</span>
+                <strong>"...funded through the production budget..."</strong>
+              </div>
+              <dl>
+                <div><dt>Amplify</dt><dd>+0.598</dd></div>
+                <div><dt>Positive held-out</dt><dd>100%</dd></div>
+                <div><dt>Suppress</dt><dd>-0.189</dd></div>
+              </dl>
+            </div>
+            <div class="case-study-row">
+              <div>
+                <span>Single random source</span>
+                <strong>"...spinoff of the original Holmes on Homes series..."</strong>
+              </div>
+              <dl>
+                <div><dt>Amplify</dt><dd>+0.068</dd></div>
+                <div><dt>Positive held-out</dt><dd>70%</dd></div>
+                <div><dt>Suppress</dt><dd>-0.334</dd></div>
+              </dl>
+            </div>
+          </div>
+        </article>
+
+        <article class="case-study-card">
+          <h3>Mode 2: Not Recognized</h3>
+          <p class="case-study-context">Held-out continuations reject the premise as not widely recognized or not officially documented.</p>
+          <div class="case-study-examples" aria-label="Not recognized held-out continuations">
+            <p><strong>A1</strong> "...not a widely recognized or officially named project..."</p>
+            <p><strong>A2</strong> "...not a well-known or officially recognized title..."</p>
+            <p><strong>A3</strong> "...no well-known entity... associated with a property or renovation project..."</p>
+          </div>
+          <div class="case-study-comparison">
+            <div class="case-study-row is-rd">
+              <div>
+                <span>RD-medoid source</span>
+                <strong>"...not a widely recognized or officially documented show..."</strong>
+              </div>
+              <dl>
+                <div><dt>Amplify</dt><dd>+0.239</dd></div>
+                <div><dt>Positive held-out</dt><dd>100%</dd></div>
+                <div><dt>Suppress</dt><dd>-0.228</dd></div>
+              </dl>
+            </div>
+            <div class="case-study-row">
+              <div>
+                <span>Single random source</span>
+                <strong>"...not a well-known or officially recognized show..."</strong>
+              </div>
+              <dl>
+                <div><dt>Amplify</dt><dd>-0.011</dd></div>
+                <div><dt>Positive held-out</dt><dd>40%</dd></div>
+                <div><dt>Suppress</dt><dd>+0.258</dd></div>
+              </dl>
+            </div>
+          </div>
+        </article>
+      </div>
+      <p class="case-study-implication">
+        <span class="caption-lead">Case-study implication:</span> the RD medoid transfers to held-out continuations in the same mode, while a random single continuation can be weak or even reverse sign. This supports the paper's claim that the discovered direction is not tied to one surface string, but captures a cluster-level causal factor shared across continuations.
+      </p>
+    </div>
+  </section>
+
+  <section class="section caveat-band" id="caveats">
+    <div class="container is-max-desktop">
+      <h2 class="title is-3 has-text-centered">Caveats</h2>
+      <div class="caveat-panel">
+        <p>
+          This page presents RD clusters as <strong>useful mechanistic hypotheses</strong>, not complete circuit explanations.
+        </p>
+        <ul>
+          <li><strong>Estimand:</strong> the intervention target is the mean demeaned logit over a sampled continuation. This differs from conventional next-token circuit analysis, which traces a single target-token logit.</li>
+          <li><strong>Cost:</strong> the method needs semantic embeddings and mechanistic attribution summaries for many sampled continuations, which can be expensive for long contexts.</li>
+          <li><strong>Labeling:</strong> clusters can mix answer identity, wording style, hedging, or formatting, so human-readable labels still need careful validation.</li>
+          <li><strong>Scope:</strong> steering tests give interventional evidence for cluster-level feature directions, but they do not trace every token-level pathway to a final token prediction.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="BibTeX">
+    <div class="container is-max-desktop content">
+      <div class="bibtex-header">
+        <h2 class="title is-3">BibTeX</h2>
+        <button class="copy-bibtex-btn" onclick="copyBibTeX()" title="Copy BibTeX to clipboard">
+          <i class="fas fa-copy"></i>
+          <span class="copy-text">Copy</span>
+        </button>
+      </div>
+      <pre id="bibtex-code"><code>@inproceedings{
+cho2026shared,
+title={Shared Semantics, Divergent Mechanisms: Unsupervised Feature Discovery by Aligning Semantics and Mechanisms},
+author={Hyunjin Cho and Youngji Roh and Jaehyung Kim},
+booktitle={Forty-third International Conference on Machine Learning},
+year={2026},
+url={https://openreview.net/forum?id=C9AhjL8aUZ}
+}</code></pre>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <div class="container is-max-desktop">
+      <div class="content has-text-centered">
+        <p>
+          This page was built from the <a href="https://github.com/eliahuhorwitz/Academic-project-page-template" target="_blank" rel="noopener">Academic Project Page Template</a>, adapted from the Nerfies project page.
+        </p>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

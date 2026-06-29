@@ -1,0 +1,47 @@
+{
+  "vllm": {
+    "max_model_len": 256
+  },
+  "stage_7c_steering": {
+    "_comment": "Low-memory retry overlay for filling missing Stage 7 baseline cells after concurrent runs OOM.",
+    "baselines": [
+      "combined_medoid"
+    ],
+    "max_samples": 50,
+    "max_cluster_samples": 5,
+    "max_batch_size": 64,
+    "cross_prefix_batching": false,
+    "prefix_batch_size": 1,
+    "clustering_top_k": 1,
+    "clustering_score_key": "harmonic",
+    "clustering_score_order": "desc",
+    "clustering_min_k": 2,
+    "clustering_max_k": 10,
+    "clustering_selection": {
+      "top_k": 1,
+      "score_key": "harmonic",
+      "score_order": "desc",
+      "min_k": 2,
+      "max_k": 10
+    },
+    "sweeps": [
+      {
+        "name": "sign_3hour_subsample_full",
+        "steering_method": "sign",
+        "h_c_selections": [
+          "full"
+        ],
+        "top_B": [
+          5
+        ],
+        "epsilon_values": [
+          -0.5,
+          -0.1,
+          0.0,
+          0.1,
+          0.5
+        ]
+      }
+    ]
+  }
+}
