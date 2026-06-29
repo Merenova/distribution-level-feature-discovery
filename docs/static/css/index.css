@@ -250,7 +250,20 @@ a:hover {
   transform: translateX(-50%);
 }
 
+.steering-source-grid-figure {
+  width: min(940px, calc(100vw - 2rem));
+  max-width: none;
+  margin: 0 auto 1.45rem;
+}
+
 .steering-demo-figure img {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.steering-source-grid-figure img {
   border: 0;
   border-radius: 0;
   background: transparent;

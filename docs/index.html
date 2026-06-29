@@ -27,7 +27,7 @@
   <link href="https://fonts.googleapis.com/css?family=Google+Sans|Noto+Sans|Castoro" rel="stylesheet">
   <link rel="stylesheet" href="static/css/bulma.min.css">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1/css/academicons.min.css">
-  <link rel="stylesheet" href="static/css/index.css?v=caveats-v1">
+  <link rel="stylesheet" href="static/css/index.css?v=steering-grid-v1">
   <script defer src="static/js/fontawesome.all.min.js"></script>
   <script defer src="static/js/index.js?v=rd-default-cloze-0097-v3"></script>
 </head>
@@ -242,6 +242,12 @@
           Our cluster intervention applies this idea to answer modes. <strong>Can one cluster-level direction move the model toward a whole answer mode, rather than only one sampled continuation?</strong> For each discovered cluster, we choose a representative source continuation, select the signed top-B attribution features from that source, and scale those features at their original prefix position and layer. We then compare <strong>RD</strong>, which uses the medoid from the joint semantic-and-mechanistic cluster, with <strong>KM-Sem</strong>, a semantic-only K-means medoid, and <strong>Single</strong>, one randomly chosen attribution vector from the same RD cluster. Across steering strengths, a useful cluster direction should show a monotonic target-cluster logit change: amplification raises the cluster's relative preference, and suppression lowers it. In the demonstration below, the star marks the source continuation defining the steering direction.
         </p>
       </div>
+      <figure class="figure-block steering-source-grid-figure">
+        <img src="static/images/rd/steering_source_cluster5_grid.png?v=transparent-v1" alt="Source continuation choices for RD, semantic K-means, and a random single baseline shown in semantic and mechanistic views" loading="lazy">
+        <figcaption aria-label="Source selection: stars mark the continuation used to choose the steering features for RD, KM-Sem, and Single across semantic and mechanistic views.">
+          <span class="caption-lead">Source selection:</span> stars mark the continuation used to choose the steering features for RD, KM-Sem, and Single across semantic and mechanistic views.
+        </figcaption>
+      </figure>
       <figure class="figure-block steering-demo-figure">
         <img src="static/images/steering_demonstration.png" alt="Diagram showing steering direction selection and cluster-level steering validation" loading="lazy">
         <figcaption aria-label="Steering setup: the selected RD medoid direction provides top-B attribution features for activation steering, then target-logit changes are measured for cluster members.">
